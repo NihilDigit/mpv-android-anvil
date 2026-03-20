@@ -1,33 +1,30 @@
 /*
  * vf_anvil.c - ANVIL Video Frame Interpolation filter for mpv
  *
- * Frame-doubling VFI: 30fps → 60fps via MV prealign v2 + QNN HTP INT8.
+ * Frame-doubling VFI: 30fps -> 60fps via MV prealign v2 + QNN HTP INT8.
  *
  * State machine:
- *   NEED_INPUT  → read frame, compute interpolated, output original curr
- *   HAVE_INTERP → output stored interpolated frame, transition to NEED_INPUT
- *
- * Interpolated frame split-screen overlay:
- *   Left of split line:  previous original frame (held still = 30fps)
- *   Right of split line: ANVIL interpolated frame (MV prealign + QNN residual)
+ *   NEED_INPUT  -> read frame, compute interpolated, output original curr
+ *   HAVE_INTERP -> output stored interpolated frame, transition to NEED_INPUT
  *
  * QNN HTP inference via dlopen (no subprocess).
  *
- * Usage: --vf=anvil:split=0.5
+ * Usage: --vf=anvil
  *
  * This file is part of mpv.
  * License: LGPL 2.1+
  */
 
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 // Section 1: Includes
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include <libavutil/motion_vector.h>
 #include <libavutil/frame.h>
@@ -36,7 +33,6 @@
 #include "filters/filter.h"
 #include "filters/filter_internal.h"
 #include "filters/user_filters.h"
-#include "options/m_option.h"
 #include "video/mp_image.h"
 #include "video/img_format.h"
 
@@ -45,9 +41,9 @@
 #include "QNN/System/QnnSystemInterface.h"
 #include "QNN/HTP/QnnHtpPerfInfrastructure.h"
 
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 // Section 2: Prealign v2 functions (frozen recipe)
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 
 #define PA_DS        4
 #define PA_MED_K     5
@@ -158,23 +154,6 @@ static void upsample(const float *in, float *out, int iH, int iW, int oH, int oW
     }
 }
 
-// Bilinear sample (single plane, uint8)
-static inline uint8_t sample_bilinear(const uint8_t *src, int W, int H,
-                                       int stride, float sx, float sy)
-{
-    int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
-    int x1 = x0 + 1, y1 = y0 + 1;
-    float wx = sx - x0, wy = sy - y0;
-    if (x0 < 0) x0 = 0; if (x0 >= W) x0 = W-1;
-    if (x1 < 0) x1 = 0; if (x1 >= W) x1 = W-1;
-    if (y0 < 0) y0 = 0; if (y0 >= H) y0 = H-1;
-    if (y1 < 0) y1 = 0; if (y1 >= H) y1 = H-1;
-    float v = (1-wx)*(1-wy)*src[y0*stride+x0] + wx*(1-wy)*src[y0*stride+x1]
-            + (1-wx)*wy*src[y1*stride+x0] + wx*wy*src[y1*stride+x1];
-    int iv = (int)(v + 0.5f);
-    return iv < 0 ? 0 : (iv > 255 ? 255 : (uint8_t)iv);
-}
-
 // Bilinear sample float (for flow-warping float RGB planes)
 static inline float sample_bilinear_f(const float *src, int W, int H,
                                        float sx, float sy)
@@ -190,9 +169,9 @@ static inline float sample_bilinear_f(const float *src, int W, int H,
          + (1-wx)*wy*src[y1*W+x0] + wx*wy*src[y1*W+x1];
 }
 
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 // Section 3: YUV <-> RGB conversion (BT.709)
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 
 // YUV420P -> planar float RGB [0,1], each plane is H*W floats
 static void yuv420p_to_rgb_float(const uint8_t *Y, int y_stride,
@@ -261,9 +240,9 @@ static void rgb_float_to_yuv420p(const float *R, const float *G, const float *B,
     }
 }
 
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 // Section 4: QNN loader (dlopen, from bench_e2e_pipeline.cpp pattern)
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
 
 #define QNN_DEFAULT_DIR "/data/data/is.xyz.mpv/files/anvil"
 #define QNN_CTX_BIN     "context.serialized.bin"
@@ -286,10 +265,18 @@ struct qnn_state {
     Qnn_Tensor_t out_tensors[QNN_MAX_TENSORS];
     uint32_t n_in, n_out;
 
-    // Pre-allocated I/O buffers
+    // Pre-allocated user-facing float32 I/O buffers
     float *input_buf;    // H*W*6 float32 NHWC
     float *output_buf;   // H*W*3 float32 NHWC
-    uint32_t in_bytes, out_bytes;
+    uint32_t in_elems, out_elems;   // total element count
+
+    // Quantization support (INT8 context binaries)
+    int input_is_quantized;   // 1 if input tensor is uint8 quantized
+    int output_is_quantized;  // 1 if output tensor is uint8 quantized
+    float in_scale, out_scale;
+    int32_t in_offset, out_offset;
+    uint8_t *in_quant_buf;    // uint8 buffer for graphExecute input
+    uint8_t *out_quant_buf;   // uint8 buffer for graphExecute output
 
     int ready;
 };
@@ -319,7 +306,7 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
 
     // QNN libs are bundled in the APK's jniLibs/arm64-v8a/ and loaded by name.
     // libcdsprpc.so is a vendor library declared via <uses-native-library> in
-    // the manifest — Android linker resolves it from /vendor/lib64/.
+    // the manifest -- Android linker resolves it from /vendor/lib64/.
     // The Skel file + context binary are extracted from assets/ to files/anvil/.
     const char *preload[] = {
         "libcdsprpc.so",        // vendor DSP RPC (from /vendor/lib64/ via manifest)
@@ -343,7 +330,7 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
     // Load libQnnSystem.so (from APK jniLibs, by name)
     q->sys_lib = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_GLOBAL);
     if (!q->sys_lib) {
-        MP_WARN(f, "QNN: dlopen %s: %s\n", path, dlerror());
+        MP_WARN(f, "QNN: dlopen libQnnSystem.so: %s\n", dlerror());
         return -1;
     }
 
@@ -475,24 +462,64 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
     MP_INFO(f, "QNN: graph '%s', %u inputs, %u outputs\n",
             graph_name, q->n_in, q->n_out);
 
-    // Calculate buffer sizes from tensor dims
-    q->in_bytes = 0;
+    // Calculate buffer sizes from tensor dims, detect quantization, log layout
+    q->in_elems = 0;
     for (uint32_t i = 0; i < q->n_in && i < QNN_MAX_TENSORS; i++) {
         uint32_t elem = 1;
-        for (uint32_t d = 0; d < meta_inputs[i].v1.rank; d++)
+        char dims_str[128] = "";
+        for (uint32_t d = 0; d < meta_inputs[i].v1.rank; d++) {
             elem *= meta_inputs[i].v1.dimensions[d];
-        q->in_bytes += elem * sizeof(float);
+            char tmp[16]; snprintf(tmp, sizeof(tmp), "%s%u", d?",":"", meta_inputs[i].v1.dimensions[d]);
+            strncat(dims_str, tmp, sizeof(dims_str)-strlen(dims_str)-1);
+        }
+        MP_INFO(f, "QNN: input[%u] dims=[%s] dataType=0x%04x\n", i, dims_str,
+                (unsigned)meta_inputs[i].v1.dataType);
+        q->in_elems += elem;
     }
-    q->out_bytes = 0;
+    q->out_elems = 0;
     for (uint32_t i = 0; i < q->n_out && i < QNN_MAX_TENSORS; i++) {
         uint32_t elem = 1;
-        for (uint32_t d = 0; d < meta_outputs[i].v1.rank; d++)
+        char dims_str[128] = "";
+        for (uint32_t d = 0; d < meta_outputs[i].v1.rank; d++) {
             elem *= meta_outputs[i].v1.dimensions[d];
-        q->out_bytes += elem * sizeof(float);
+            char tmp[16]; snprintf(tmp, sizeof(tmp), "%s%u", d?",":"", meta_outputs[i].v1.dimensions[d]);
+            strncat(dims_str, tmp, sizeof(dims_str)-strlen(dims_str)-1);
+        }
+        MP_INFO(f, "QNN: output[%u] dims=[%s] dataType=0x%04x\n", i, dims_str,
+                (unsigned)meta_outputs[i].v1.dataType);
+        q->out_elems += elem;
     }
 
-    q->input_buf  = (float *)calloc(1, q->in_bytes);
-    q->output_buf = (float *)calloc(1, q->out_bytes);
+    // Detect INT8 quantization from tensor dataType
+    // QNN_DATATYPE_UFIXED_POINT_8 = 0x0408, QNN_DATATYPE_SFIXED_POINT_8 = 0x0308
+    uint32_t in_dt = meta_inputs[0].v1.dataType;
+    uint32_t out_dt = meta_outputs[0].v1.dataType;
+
+    q->input_is_quantized  = (in_dt == 0x0408 || in_dt == 0x0308);
+    q->output_is_quantized = (out_dt == 0x0408 || out_dt == 0x0308);
+
+    if (q->input_is_quantized) {
+        q->in_scale  = meta_inputs[0].v1.quantizeParams.scaleOffsetEncoding.scale;
+        q->in_offset = meta_inputs[0].v1.quantizeParams.scaleOffsetEncoding.offset;
+        MP_INFO(f, "QNN: input quantized (0x%04x): scale=%f, offset=%d\n",
+                (unsigned)in_dt, q->in_scale, (int)q->in_offset);
+    }
+    if (q->output_is_quantized) {
+        q->out_scale  = meta_outputs[0].v1.quantizeParams.scaleOffsetEncoding.scale;
+        q->out_offset = meta_outputs[0].v1.quantizeParams.scaleOffsetEncoding.offset;
+        MP_INFO(f, "QNN: output quantized (0x%04x): scale=%f, offset=%d\n",
+                (unsigned)out_dt, q->out_scale, (int)q->out_offset);
+    }
+
+    // Allocate user-facing float32 buffers (always needed)
+    q->input_buf  = (float *)calloc(q->in_elems, sizeof(float));
+    q->output_buf = (float *)calloc(q->out_elems, sizeof(float));
+
+    // Allocate uint8 buffers for graphExecute if quantized
+    if (q->input_is_quantized)
+        q->in_quant_buf = (uint8_t *)calloc(q->in_elems, sizeof(uint8_t));
+    if (q->output_is_quantized)
+        q->out_quant_buf = (uint8_t *)calloc(q->out_elems, sizeof(uint8_t));
 
     // Load context from binary
     Qnn_ErrorHandle_t ctx_err = q->qnn.contextCreateFromBinary(
@@ -514,44 +541,79 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
     }
 
     // Set up tensor arrays pointing to our buffers
-    uint32_t in_off = 0;
+    // For quantized tensors: point to uint8 buffers; for float: point to float32 buffers
+    uint32_t in_off_bytes = 0;
     for (uint32_t i = 0; i < q->n_in && i < QNN_MAX_TENSORS; i++) {
         q->in_tensors[i] = meta_inputs[i];
         q->in_tensors[i].v1.memType = QNN_TENSORMEMTYPE_RAW;
         uint32_t elem = 1;
         for (uint32_t d = 0; d < q->in_tensors[i].v1.rank; d++)
             elem *= q->in_tensors[i].v1.dimensions[d];
-        uint32_t sz = elem * sizeof(float);
-        q->in_tensors[i].v1.clientBuf.data = (uint8_t *)q->input_buf + in_off;
-        q->in_tensors[i].v1.clientBuf.dataSize = sz;
-        in_off += sz;
+        if (q->input_is_quantized) {
+            uint32_t sz = elem * sizeof(uint8_t);
+            q->in_tensors[i].v1.clientBuf.data = q->in_quant_buf + in_off_bytes;
+            q->in_tensors[i].v1.clientBuf.dataSize = sz;
+            in_off_bytes += sz;
+        } else {
+            uint32_t sz = elem * sizeof(float);
+            q->in_tensors[i].v1.clientBuf.data = (uint8_t *)q->input_buf + in_off_bytes;
+            q->in_tensors[i].v1.clientBuf.dataSize = sz;
+            in_off_bytes += sz;
+        }
     }
 
-    uint32_t out_off = 0;
+    uint32_t out_off_bytes = 0;
     for (uint32_t i = 0; i < q->n_out && i < QNN_MAX_TENSORS; i++) {
         q->out_tensors[i] = meta_outputs[i];
         q->out_tensors[i].v1.memType = QNN_TENSORMEMTYPE_RAW;
         uint32_t elem = 1;
         for (uint32_t d = 0; d < q->out_tensors[i].v1.rank; d++)
             elem *= q->out_tensors[i].v1.dimensions[d];
-        uint32_t sz = elem * sizeof(float);
-        q->out_tensors[i].v1.clientBuf.data = (uint8_t *)q->output_buf + out_off;
-        q->out_tensors[i].v1.clientBuf.dataSize = sz;
-        out_off += sz;
+        if (q->output_is_quantized) {
+            uint32_t sz = elem * sizeof(uint8_t);
+            q->out_tensors[i].v1.clientBuf.data = q->out_quant_buf + out_off_bytes;
+            q->out_tensors[i].v1.clientBuf.dataSize = sz;
+            out_off_bytes += sz;
+        } else {
+            uint32_t sz = elem * sizeof(float);
+            q->out_tensors[i].v1.clientBuf.data = (uint8_t *)q->output_buf + out_off_bytes;
+            q->out_tensors[i].v1.clientBuf.dataSize = sz;
+            out_off_bytes += sz;
+        }
     }
 
     free(binary);
     q->ready = 1;
-    MP_INFO(f, "QNN: initialized (in=%u bytes, out=%u bytes)\n", q->in_bytes, q->out_bytes);
+    MP_INFO(f, "QNN: initialized (in=%u elems, out=%u elems, in_quant=%d, out_quant=%d)\n",
+            q->in_elems, q->out_elems, q->input_is_quantized, q->output_is_quantized);
     return 0;
 }
 
 static Qnn_ErrorHandle_t qnn_execute(struct qnn_state *q)
 {
-    return q->qnn.graphExecute(q->graph,
-                               q->in_tensors, q->n_in,
-                               q->out_tensors, q->n_out,
-                               NULL, NULL);
+    // Pre-execute: quantize float32 input_buf -> uint8 in_quant_buf
+    if (q->input_is_quantized) {
+        float inv_scale = 1.0f / q->in_scale;
+        for (uint32_t i = 0; i < q->in_elems; i++) {
+            float v = roundf(q->input_buf[i] * inv_scale) - (float)q->in_offset;
+            q->in_quant_buf[i] = (uint8_t)(v < 0.0f ? 0 : (v > 255.0f ? 255 : (int)v));
+        }
+    }
+
+    Qnn_ErrorHandle_t err = q->qnn.graphExecute(q->graph,
+                                                 q->in_tensors, q->n_in,
+                                                 q->out_tensors, q->n_out,
+                                                 NULL, NULL);
+
+    // Post-execute: dequantize uint8 out_quant_buf -> float32 output_buf
+    if (err == QNN_SUCCESS && q->output_is_quantized) {
+        for (uint32_t i = 0; i < q->out_elems; i++) {
+            q->output_buf[i] = q->out_scale *
+                ((float)q->out_quant_buf[i] + (float)q->out_offset);
+        }
+    }
+
+    return err;
 }
 
 static void qnn_cleanup(struct qnn_state *q)
@@ -562,27 +624,23 @@ static void qnn_cleanup(struct qnn_state *q)
     if (q->sys_ctx) q->sys.systemContextFree(q->sys_ctx);
     free(q->input_buf);
     free(q->output_buf);
+    free(q->in_quant_buf);
+    free(q->out_quant_buf);
     if (q->htp_lib) dlclose(q->htp_lib);
     if (q->sys_lib) dlclose(q->sys_lib);
     memset(q, 0, sizeof(*q));
 }
 
-// ════════════════════════════════════════════════════════════════════
-// Section 5: Filter state machine (frame doubling)
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
+// Section 5: Filter state and workspace
+// ====================================================================
 
 enum anvil_state {
     STATE_NEED_INPUT,
     STATE_HAVE_INTERP,
 };
 
-struct anvil_opts {
-    float split;
-};
-
 struct priv {
-    struct anvil_opts *opts;
-
     enum anvil_state state;
     int frame_count;
 
@@ -591,7 +649,6 @@ struct priv {
 
     // Stored interpolated frame (output in HAVE_INTERP state)
     struct mp_image *interp;
-    double interp_pts;
 
     // Prealign workspace
     int alloc_w, alloc_h;
@@ -653,6 +710,10 @@ static void alloc_workspace(struct priv *p, int w, int h)
     p->alloc_w = w; p->alloc_h = h;
 }
 
+// ====================================================================
+// Section 6: Interpolation pipeline
+// ====================================================================
+
 // Run prealign v2 on the flow field (modifies flow_x/flow_y in place)
 static void run_prealign_v2(struct priv *p, int W, int H)
 {
@@ -703,22 +764,31 @@ static void pack_nhwc6(float *nhwc, const float *r0, const float *g0, const floa
     }
 }
 
-// Compute prealigned blend + QNN residual → output RGB
-// If no QNN, just does blend. Output is float RGB [0,1].
-static void compute_interpolated(struct priv *p, struct mp_filter *f,
-                                  struct mp_image *prev, struct mp_image *curr,
-                                  const AVMotionVector *mvs, int n_mvs,
-                                  int W, int H)
+// Get monotonic time in milliseconds
+static double get_time_ms(void)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// Compute prealigned blend + QNN residual -> full interpolated frame.
+// Returns a new mp_image (YUV420P) with PTS set to midpoint.
+static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f,
+                                              struct mp_image *prev,
+                                              struct mp_image *curr,
+                                              const AVMotionVector *mvs, int n_mvs)
+{
+    int W = curr->w, H = curr->h;
+    int px = W * H;
+
     alloc_workspace(p, W, H);
 
-    // Build dense flow from MVs
+    // 1. Build dense flow from MVs + prealign v2
     zoh_fill(mvs, n_mvs, p->flow_x, p->flow_y, H, W);
-
-    // Prealign v2: downsample → median → gaussian → upsample
     run_prealign_v2(p, W, H);
 
-    // Convert both frames from YUV420P to float RGB
+    // 2. Convert both frames from YUV420P to float RGB
     yuv420p_to_rgb_float(prev->planes[0], prev->stride[0],
                           prev->planes[1], prev->stride[1],
                           prev->planes[2], prev->stride[2],
@@ -730,7 +800,7 @@ static void compute_interpolated(struct priv *p, struct mp_filter *f,
                           p->rgb_curr[0], p->rgb_curr[1], p->rgb_curr[2],
                           W, H);
 
-    // Warp prev backward by -flow/2, curr forward by +flow/2
+    // 3. Warp prev backward by -flow/2, curr forward by +flow/2
     warp_rgb_planes(p->rgb_warp0[0], p->rgb_warp0[1], p->rgb_warp0[2],
                     p->rgb_prev[0],  p->rgb_prev[1],  p->rgb_prev[2],
                     p->flow_x, p->flow_y, W, H, -1.0f);
@@ -738,123 +808,61 @@ static void compute_interpolated(struct priv *p, struct mp_filter *f,
                     p->rgb_curr[0],  p->rgb_curr[1],  p->rgb_curr[2],
                     p->flow_x, p->flow_y, W, H, +1.0f);
 
-    // Prealigned blend: (warp0 + warp1) / 2
-    int px = W * H;
-    for (int c = 0; c < 3; c++) {
-        for (int i = 0; i < px; i++) {
-            float *w0 = c == 0 ? p->rgb_warp0[0] : (c == 1 ? p->rgb_warp0[1] : p->rgb_warp0[2]);
-            float *w1 = c == 0 ? p->rgb_warp1[0] : (c == 1 ? p->rgb_warp1[1] : p->rgb_warp1[2]);
-            p->rgb_out[c][i] = (w0[i] + w1[i]) * 0.5f;
-        }
-    }
+    // 4. Prealigned blend: (warp0 + warp1) / 2
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < px; i++)
+            p->rgb_out[c][i] = (p->rgb_warp0[c][i] + p->rgb_warp1[c][i]) * 0.5f;
 
-    // Try QNN inference for residual
+    // 5. QNN inference: add NHWC residual to blend
     if (p->qnn.ready) {
         pack_nhwc6(p->qnn.input_buf,
                    p->rgb_warp0[0], p->rgb_warp0[1], p->rgb_warp0[2],
                    p->rgb_warp1[0], p->rgb_warp1[1], p->rgb_warp1[2],
                    W, H);
 
+        double t0 = get_time_ms();
         Qnn_ErrorHandle_t err = qnn_execute(&p->qnn);
+        double t1 = get_time_ms();
+
         if (err == QNN_SUCCESS) {
-            // Add 3ch NHWC residual to blend
+            // Model output is NHWC [1, H, W, 3] after dequantization
             const float *res = p->qnn.output_buf;
-            for (int y = 0; y < H; y++) {
-                for (int x = 0; x < W; x++) {
-                    int idx = y * W + x;
-                    const float *r = res + idx * 3;
-                    p->rgb_out[0][idx] += r[0];
-                    p->rgb_out[1][idx] += r[1];
-                    p->rgb_out[2][idx] += r[2];
-                }
+            for (int i = 0; i < px; i++) {
+                p->rgb_out[0][i] += res[i * 3 + 0];  // R
+                p->rgb_out[1][i] += res[i * 3 + 1];  // G
+                p->rgb_out[2][i] += res[i * 3 + 2];  // B
             }
+
+            if (p->frame_count % 60 == 0)
+                MP_INFO(f, "ANVIL: QNN inference %.1f ms\n", t1 - t0);
         } else {
             MP_WARN(f, "QNN: graphExecute failed (0x%lx), using blend only\n",
                     (unsigned long)err);
         }
     }
 
-    // Clamp to [0,1]
-    for (int c = 0; c < 3; c++) {
+    // 6. Clamp to [0,1]
+    for (int c = 0; c < 3; c++)
         for (int i = 0; i < px; i++) {
             if (p->rgb_out[c][i] < 0.0f) p->rgb_out[c][i] = 0.0f;
             if (p->rgb_out[c][i] > 1.0f) p->rgb_out[c][i] = 1.0f;
         }
-    }
-}
 
-// Build the interpolated output frame with split-line overlay:
-//   Left of split:  prev original (held still = 30fps)
-//   Right of split: ANVIL interpolated
-static struct mp_image *build_interp_frame(struct priv *p,
-                                            struct mp_image *prev,
-                                            struct mp_image *curr,
-                                            int W, int H)
-{
-    struct mp_image *out = mp_image_new_copy(prev);
-    float split = p->opts->split;
-    if (split < 0.0f) split = 0.0f;
-    if (split > 1.0f) split = 1.0f;
-    int split_x = (int)(split * W);
-    if (split_x < 0) split_x = 0;
-    if (split_x > W) split_x = W;
-
-    // Left side: prev original (already there from mp_image_new_copy)
-    // Right side: convert ANVIL interpolated RGB back to YUV420P
-    // We do this by writing the full interpolated result to a temp frame,
-    // then copying the right portion.
-
-    // Convert interpolated float RGB to YUV into the output frame's right half
-    // Strategy: write full YUV from RGB, then restore left half from prev
-    struct mp_image *interp_yuv = mp_image_new_copy(prev);
-
+    // 7. Convert float RGB -> YUV420P output frame
+    struct mp_image *out = mp_image_new_copy(curr);
     rgb_float_to_yuv420p(p->rgb_out[0], p->rgb_out[1], p->rgb_out[2],
-                          interp_yuv->planes[0], interp_yuv->stride[0],
-                          interp_yuv->planes[1], interp_yuv->stride[1],
-                          interp_yuv->planes[2], interp_yuv->stride[2],
+                          out->planes[0], out->stride[0],
+                          out->planes[1], out->stride[1],
+                          out->planes[2], out->stride[2],
                           W, H);
-
-    // Copy right half from interp_yuv into out
-    int n_planes = out->fmt.num_planes;
-    if (n_planes > 3) n_planes = 3;
-
-    for (int pl = 0; pl < n_planes; pl++) {
-        int pw = mp_image_plane_w(out, pl);
-        int ph = mp_image_plane_h(out, pl);
-        int split_px = split_x;
-        if (pl > 0) split_px = split_x >> 1;  // chroma subsampling
-
-        for (int y = 0; y < ph; y++) {
-            uint8_t *dst = out->planes[pl] + y * out->stride[pl];
-            const uint8_t *src = interp_yuv->planes[pl] + y * interp_yuv->stride[pl];
-            for (int x = split_px; x < pw; x++)
-                dst[x] = src[x];
-        }
-    }
-
-    mp_image_unrefp(&interp_yuv);
-
-    // Draw 2px white vertical line at split position on Y plane
-    if (split_x > 0 && split_x < W) {
-        for (int y = 0; y < H; y++) {
-            out->planes[0][y * out->stride[0] + split_x] = 255;
-            if (split_x + 1 < W)
-                out->planes[0][y * out->stride[0] + split_x + 1] = 255;
-        }
-        // Chroma: set to neutral (128) at split line
-        int cW = W >> 1;
-        int cH = H >> 1;
-        int cx = split_x >> 1;
-        if (cx > 0 && cx < cW) {
-            for (int y = 0; y < cH; y++) {
-                out->planes[1][y * out->stride[1] + cx] = 128;
-                out->planes[2][y * out->stride[2] + cx] = 128;
-            }
-        }
-    }
+    out->pts = (prev->pts + curr->pts) / 2.0;
 
     return out;
 }
+
+// ====================================================================
+// Section 7: Frame doubling state machine
+// ====================================================================
 
 static void f_process(struct mp_filter *f)
 {
@@ -867,7 +875,6 @@ static void f_process(struct mp_filter *f)
 
         struct mp_image *out = p->interp;
         p->interp = NULL;
-        out->pts = p->interp_pts;
         mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
         p->state = STATE_NEED_INPUT;
         return;
@@ -917,25 +924,20 @@ static void f_process(struct mp_filter *f)
     }
 
     if (p->frame_count % 60 == 1) {
-        MP_INFO(f, "frame %d: %dx%d, %d MVs, qnn=%d\n",
+        MP_INFO(f, "ANVIL: frame %d, %dx%d, %d MVs, qnn=%d\n",
                 p->frame_count, W, H, n_mvs, p->qnn.ready);
     }
 
-    // Need prev + MVs for interpolation
+    // First frame (I-frame, no MVs) or no prev: just pass through
     if (!p->prev || n_mvs == 0) {
         mp_image_unrefp(&p->prev);
         p->prev = mp_image_new_ref(mpi);
-        // Pass through original frame (no interpolated frame to emit)
         mp_pin_in_write(f->ppins[1], frame);
         return;
     }
 
     // Compute interpolated frame between prev and curr
-    compute_interpolated(p, f, p->prev, mpi, mvs, n_mvs, W, H);
-
-    // Build the split-screen interpolated frame
-    p->interp = build_interp_frame(p, p->prev, mpi, W, H);
-    p->interp_pts = (p->prev->pts + mpi->pts) / 2.0;
+    p->interp = compute_interpolated(p, f, p->prev, mpi, mvs, n_mvs);
 
     // Update prev
     mp_image_unrefp(&p->prev);
@@ -974,9 +976,9 @@ static const struct mp_filter_info filter = {
     .priv_size = sizeof(struct priv),
 };
 
-// ════════════════════════════════════════════════════════════════════
-// Section 6: Filter registration
-// ════════════════════════════════════════════════════════════════════
+// ====================================================================
+// Section 8: Filter registration
+// ====================================================================
 
 static struct mp_filter *f_create(struct mp_filter *parent, void *options)
 {
@@ -987,12 +989,6 @@ static struct mp_filter *f_create(struct mp_filter *parent, void *options)
     }
 
     struct priv *p = f->priv;
-    p->opts = talloc_ptrtype(f, p->opts);
-    if (options) {
-        *p->opts = *(struct anvil_opts *)options;
-    } else {
-        p->opts->split = 0.5f;
-    }
     talloc_free(options);
 
     p->state = STATE_NEED_INPUT;
@@ -1000,26 +996,14 @@ static struct mp_filter *f_create(struct mp_filter *parent, void *options)
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-    MP_INFO(f, "ANVIL VFI frame-doubler: split=%.2f (left=30fps hold, right=ANVIL 60fps)\n",
-            p->opts->split);
+    MP_INFO(f, "ANVIL VFI frame-doubler (30fps -> 60fps)\n");
     return f;
 }
-
-#define OPT_BASE_STRUCT struct anvil_opts
-static const m_option_t vf_opts_fields[] = {
-    {"split", OPT_FLOAT(split), M_RANGE(0.0, 1.0)},
-    {0}
-};
 
 const struct mp_user_filter_entry vf_anvil = {
     .desc = {
         .description = "ANVIL video frame interpolation",
         .name = "anvil",
-        .priv_size = sizeof(OPT_BASE_STRUCT),
-        .priv_defaults = &(const OPT_BASE_STRUCT){
-            .split = 0.5f,
-        },
-        .options = vf_opts_fields,
     },
     .create = f_create,
 };
