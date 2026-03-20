@@ -1,30 +1,24 @@
 /*
  * vf_anvil.c - ANVIL Video Frame Interpolation filter for mpv
  *
- * Frame-doubling VFI: 30fps -> 60fps via MV prealign v2 + QNN HTP INT8.
+ * Copyright (c) 2026 NihilDigit
  *
- * State machine:
- *   NEED_INPUT  -> read frame, compute interpolated, output original curr
- *   HAVE_INTERP -> output stored interpolated frame, transition to NEED_INPUT
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * QNN HTP inference via dlopen (no subprocess).
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * Pipeline (Vulkan GPU + HTP, pipelined Phase B):
- *   Phase 1a (CPU, ~2ms): ZOH + downsample to 1/4 res → SSBO
- *   Phase 1b (GPU, ~2ms): median5 ×2 + gauss_sep ×4 (1/4 res flow)
- *   Phase 2  (GPU, ~3ms): warp_pack (upsample flow + warp YUV + yuv2rgb + blend + NHWC)
- *   Phase 3  (HTP, ~13ms): QNN graphExecute [ASYNC — overlaps with downstream render]
- *   Phase 4  (GPU or CPU, ~1-3ms): dequant + residual + rgb2yuv
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
  *
- * Phase B pipeline overlap: HTP runs in background thread while mpv renders
- * the original frame. Double-buffered QNN I/O prevents data races.
- *
- * CPU fallback (ARM64 NEON + multi-threaded) used when Vulkan unavailable.
- *
+ * ---
+ * Three-accelerator pipeline (CPU + Vulkan GPU + QNN HTP INT8) for
+ * real-time 1080p frame doubling via codec MV prealignment.
  * Usage: --vf=anvil
- *
- * This file is part of mpv.
- * License: LGPL 2.1+
  */
 
 // ====================================================================

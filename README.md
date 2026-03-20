@@ -190,4 +190,6 @@ This demo is built on [mpv-android](https://github.com/mpv-android/mpv-android) 
 
 ## License
 
-The mpv-android app shell is MIT licensed (original authors: Ilya Zhuravlev, sfan5). The ANVIL VFI filter (`anvil/filter/vf_anvil.c`) and Vulkan shaders are LGPL 2.1+ (compatible with libmpv's license). See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE). This repo is a research demo fork of [mpv-android](https://github.com/mpv-android/mpv-android) (MIT, original authors: Ilya Zhuravlev, sfan5). The ANVIL filter and Vulkan shaders are original work, also MIT licensed.
+
+Note: This app links against libmpv (LGPL 2.1+) as a shared library at runtime, which is permissible under LGPL terms.
