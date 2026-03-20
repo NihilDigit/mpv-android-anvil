@@ -8,10 +8,11 @@ layout(set=0, binding=1) writeonly buffer Out { float data_out[]; };
 
 layout(push_constant) uniform Params { int width, height, dir; };
 
-// Gaussian kernel σ=2, radius=6 (13 taps), pre-normalized
+// Gaussian kernel σ=2, radius=6 (13 taps), normalized (sum=1.0)
+// Generated: exp(-x²/(2σ²)) for x=-6..6, then ÷ sum
 const float kernel[13] = float[13](
-    0.00443, 0.01039, 0.02087, 0.03593, 0.05298, 0.06694, 0.07237,
-    0.06694, 0.05298, 0.03593, 0.02087, 0.01039, 0.00443
+    0.00222, 0.00877, 0.02702, 0.06483, 0.12111, 0.17621, 0.19968,
+    0.17621, 0.12111, 0.06483, 0.02702, 0.00877, 0.00222
 );
 
 void main() {
