@@ -40,50 +40,130 @@ INT8 quantization loss: **-0.19 dB** (negligible).
 | Dimensity 9300 | APU 790 | 24.4 ms | Tested |
 | Dimensity 9400+ | APU 890 | 25.5 ms | Tested |
 
-## Building
+## Building from Source
 
 ### Prerequisites
 
-- Android SDK & NDK (the build script downloads them automatically)
-- Qualcomm QAIRT SDK (for QNN HTP headers and runtime libraries)
+| Requirement | Notes |
+|-------------|-------|
+| Linux x86_64 host | Tested on Arch Linux; Ubuntu 22.04+ should work |
+| Android SDK | Auto-downloaded by build script if `ANDROID_HOME` not set |
+| Android NDK r29 | Auto-downloaded by build script |
+| Qualcomm QAIRT SDK | **Manual install required** — provides QNN headers + HTP runtime .so files |
+| ~20 GB disk space | For NDK, SDK, and built dependencies |
 
-### QNN Runtime Setup
+### Step 1: Install Qualcomm QAIRT SDK
 
-This repo does not include proprietary Qualcomm libraries. Provide them from a QAIRT SDK install:
+Download the Qualcomm AI Engine Direct SDK (QAIRT) from [Qualcomm AI Hub](https://aihub.qualcomm.com/) or the Qualcomm package manager. Version 2.42+ is recommended.
+
+After installation, set the environment variable:
 
 ```sh
-export QAIRT_SDK_ROOT=/opt/qcom/aistack/qairt/<version>
+export QAIRT_SDK_ROOT=/opt/qcom/aistack/qairt/2.42.0.251225  # adjust to your version
+# Verify:
+ls "$QAIRT_SDK_ROOT/include/QNN/QnnInterface.h"  # should exist
+```
 
-# ARM64 runtime libraries → bundled in APK
+### Step 2: Copy QNN Runtime Libraries
+
+The QAIRT SDK provides proprietary shared libraries that must be bundled in the APK. These are **not** included in the repo (they are `.gitignore`d).
+
+```sh
+# ARM64 runtime libraries → packaged into APK's jniLibs
 mkdir -p app/src/main/qnnLibs/arm64-v8a
 cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtp.so"        app/src/main/qnnLibs/arm64-v8a/
 cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnSystem.so"     app/src/main/qnnLibs/arm64-v8a/
 cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtpPrepare.so" app/src/main/qnnLibs/arm64-v8a/
 cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtpV75Stub.so" app/src/main/qnnLibs/arm64-v8a/
 
-# Hexagon Skel → deployed to device at first run
+# Hexagon Skel binary (32-bit DSP code) → packaged into APK assets
 mkdir -p app/src/main/assets/anvil
 cp "$QAIRT_SDK_ROOT/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so" app/src/main/assets/anvil/
 ```
 
-The INT8 model context binary (`app/src/main/assets/anvil/context.serialized.bin`) is included in the repo.
+> **Note:** The V75 Skel/Stub targets Snapdragon 8 Gen 3 (SM8650). For other SoCs, replace with the appropriate version (e.g., `v73` for SD 8 Gen 2, `v69` for SD 7+ Gen 2).
 
-### Build
+### Step 3: Build
+
+The build script downloads Android SDK/NDK (if needed), compiles FFmpeg, libplacebo, mpv, and the ANVIL filter, then produces the APK:
 
 ```sh
 cd buildscripts
-export QAIRT_SDK_ROOT=/opt/qcom/aistack/qairt/<version>
+export QAIRT_SDK_ROOT=/opt/qcom/aistack/qairt/2.42.0.251225
 bash buildall.sh --arch arm64
-# Output: app/build/outputs/apk/default/debug/app-default-arm64-v8a-debug.apk
 ```
+
+First build takes ~15-30 minutes. Subsequent builds are incremental (~5 seconds if only ANVIL filter changed).
+
+**Output APKs:**
+```
+app/build/outputs/apk/default/debug/app-default-arm64-v8a-debug.apk
+app/build/outputs/apk/default/release/app-default-arm64-v8a-release-unsigned.apk
+```
+
+### Step 4: Install and First Run
+
+```sh
+adb install -r app/build/outputs/apk/default/debug/app-default-arm64-v8a-debug.apk
+```
+
+On first launch, the app extracts QNN assets (context binary + Skel) from the APK to its private storage. The demo videos are also extracted on first tap.
+
+**Required device-side config** (`/data/data/com.nihildigit.anvildemo/files/mpv.conf`):
+```
+vf=anvil
+vd-lavc-o=flags2=+export_mvs
+hwdec=no
+pause=no
+loop=inf
+```
+
+Create it via:
+```sh
+adb shell "run-as com.nihildigit.anvildemo sh -c '
+echo vf=anvil > files/mpv.conf
+echo vd-lavc-o=flags2=+export_mvs >> files/mpv.conf
+echo hwdec=no >> files/mpv.conf
+echo pause=no >> files/mpv.conf
+echo loop=inf >> files/mpv.conf
+'"
+```
+
+### Step 5: Verify
+
+Check logcat for successful initialization:
+```sh
+adb logcat -v brief -s mpv | grep ANVIL
+```
+
+Expected output:
+```
+ANVIL VFI frame-doubler (30fps -> 60fps, Vulkan GPU + HTP)
+QNN: graph 'D_unet_v3bs_nomv_1080p', 1 inputs, 1 outputs
+QNN: HTP perf profile = power_saver (err=0x0)
+ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
+ANVIL: Vulkan GPU compute ready (1920x1080)
+ANVIL: HTP async thread started (pipeline parallelism)
+ANVIL[GPU/Q/async]: total=25.5ms  P1a=3.3  GPU=2.7  copy=0.9  P3=13.5  P4(GPU)=2.7
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `QNN: cannot open .../context.serialized.bin` | Assets not extracted | Clear app data and relaunch |
+| `QNN: dlopen libQnnHtp.so: ...` | Missing QNN .so files | Re-run Step 2 and rebuild |
+| `QNN: contextCreateFromBinary failed` | Skel file missing or wrong version | Check `libQnnHtpV*Skel.so` in assets |
+| `qnn=0` in frame logs | QNN init failed | Check all above; verify device has Hexagon DSP |
+| No `ANVIL[...]` timing logs | Filter not active | Verify `mpv.conf` has `vf=anvil` and `hwdec=no` |
+| Video plays but no interpolation | H.265/VP9 codec or non-1080p | ANVIL requires H.264 at 1920×1080 |
 
 ### Usage
 
-1. Install the APK
-2. Open any H.264 video file with the app
-3. The ANVIL filter activates automatically on H.264 content with `hwdec=no` and MV export enabled (configured in `mpv.conf`)
-
-The filter logs per-frame timing to logcat under tag `mpv` with prefix `ANVIL[...]`.
+- **Demo videos**: Tap any of the 4 scenario cards on the launcher screen
+- **Custom video**: Tap "Load Custom Video" — the app validates H.264 codec and 1080p resolution before playing
+- **A/B comparison**: During playback, tap the screen to show controls, then tap the green **VFI** button to toggle interpolation on/off
+- **Timing data**: Per-frame latency is logged to logcat with tag `mpv` and prefix `ANVIL[GPU/Q/async]`
 
 ## Architecture
 
