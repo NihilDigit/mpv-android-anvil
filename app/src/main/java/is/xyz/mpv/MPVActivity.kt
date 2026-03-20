@@ -194,6 +194,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             playBtn.setOnClickListener { player.cyclePause() }
             cycleDecoderBtn.setOnClickListener { player.cycleHwdec() }
             cycleSpeedBtn.setOnClickListener { cycleSpeed() }
+            toggleVfiBtn.setOnClickListener { toggleVfi() }
             topLockBtn.setOnClickListener { lockUI() }
             topPiPBtn.setOnClickListener { goIntoPiP() }
             topMenuBtn.setOnClickListener { openTopMenu() }
@@ -1281,6 +1282,20 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     private fun cycleSpeed() {
         player.cycleSpeed()
+    }
+
+    private var vfiEnabled = true
+    private fun toggleVfi() {
+        vfiEnabled = !vfiEnabled
+        if (vfiEnabled) {
+            MPVLib.setPropertyString("vf", "anvil")
+            binding.toggleVfiBtn.text = "VFI"
+            binding.toggleVfiBtn.setTextColor(0xFF4CAF50.toInt()) // green
+        } else {
+            MPVLib.setPropertyString("vf", "")
+            binding.toggleVfiBtn.text = "VFI"
+            binding.toggleVfiBtn.setTextColor(0xFF888888.toInt()) // gray
+        }
     }
 
     private fun pickSpeed() {

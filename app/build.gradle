@@ -9,11 +9,12 @@ android {
     compileSdk 35
 
     defaultConfig {
+        applicationId "com.nihildigit.anvildemo"
         minSdkVersion 28  // raised for Vulkan + QNN HTP
         targetSdk 35
 
-        versionCode 44
-        versionName "2025-12-27-release"
+        versionCode 100
+        versionName "1.0.0-demo"
 
         vectorDrawables.useSupportLibrary = true
     }
@@ -85,4 +86,5 @@ dependencies {
     implementation 'androidx.media:media:1.7.1'
     implementation 'androidx.preference:preference-ktx:1.2.1'
     implementation 'com.google.android.material:material:1.13.0'
+    implementation 'androidx.cardview:cardview:1.0.0'
 }

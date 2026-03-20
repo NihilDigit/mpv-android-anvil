@@ -14,6 +14,12 @@
         <item name="android:textColorLink">@android:color/background_light</item>
     </style>
 
+    <style name="FilePickerTheme.NoActionBar" parent="FilePickerTheme">
+        <item name="windowNoTitle">true</item>
+        <item name="windowActionBar">false</item>
+        <item name="android:windowBackground">#000000</item>
+    </style>
+
     <style name="FilePickerThemeSpecial" parent="FilePickerTheme">
         <!-- used to draw behind navigation bar -->
         <item name="android:windowTranslucentNavigation">true</item>
@@ -50,6 +56,14 @@
         <item name="android:colorBackground">?attr/colorSurface</item>
     </style>
 
+
+    <!-- ANVIL Demo launcher theme (needs MaterialComponents for CardView/Button) -->
+    <style name="AnvilDemoTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorPrimaryDark">@color/primary_dark</item>
+        <item name="colorAccent">@color/accent</item>
+        <item name="android:windowBackground">#121218</item>
+    </style>
 
     <!-- Material3 Switches -->
     <style name="Preference.SwitchPreferenceCompat" parent="Preference.SwitchPreferenceCompat.Material" tools:override="true">

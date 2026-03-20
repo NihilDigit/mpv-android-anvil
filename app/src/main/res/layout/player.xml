@@ -179,6 +179,14 @@
                     android:textColor="@android:color/white"
                     tools:text="1.00X" />
 
+                <Button
+                    android:id="@+id/toggleVfiBtn"
+                    style="?buttonBarButtonStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="#4CAF50"
+                    android:text="VFI" />
+
             </LinearLayout>
         </LinearLayout>
 

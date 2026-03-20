@@ -206,7 +206,7 @@
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize"
-            android:theme="@style/FilePickerTheme"
+            android:theme="@style/FilePickerTheme.NoActionBar"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

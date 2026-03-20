@@ -3,8 +3,8 @@
      them to be changed based on the locale and options. -->
 <resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
     <!-- Simple strings. -->
-    <string name="mpv_activity">mpv</string>
-    <string name="label_share_intent">Play in mpv</string>
+    <string name="mpv_activity">ANVIL VFI</string>
+    <string name="label_share_intent">Play with ANVIL VFI</string>
     <string name="title_activity_settings">Settings</string>
     <string name="dialog_ok">OK</string>
     <string name="dialog_cancel">Cancel</string>
@@ -200,6 +200,22 @@
     <string name="scaler_param2">Param 2</string>
     <string name="interpolation_switch">Enable interpolation</string>
     <string name="interpolation_video_sync">Video sync</string>
+
+    <!-- ANVIL Demo Launcher -->
+    <string name="demo_title">ANVIL VFI Demo</string>
+    <string name="demo_subtitle">Real-time NPU Frame Interpolation</string>
+    <string name="demo_load_custom">Load Custom Video</string>
+    <string name="demo_info">Requires H.264 1080p \u2022 Filter active on P-frames with MVs</string>
+    <string name="demo_invalid_title">Unsupported Video</string>
+    <string name="demo_invalid_msg">ANVIL requires H.264 (AVC) codec at 1920\u00d71080 resolution.\n\nDetected: %1$s at %2$dx%3$d</string>
+    <string name="demo_card1_title">ANVIL Wins</string>
+    <string name="demo_card1_desc">Regular pedestrian motion \u2014 MV prior excels</string>
+    <string name="demo_card2_title">Tie</string>
+    <string name="demo_card2_desc">Dense crowd running \u2014 both methods challenged</string>
+    <string name="demo_card3_title">RIFE Wins</string>
+    <string name="demo_card3_desc">Large tractor \u2014 needs sub-pixel optical flow</string>
+    <string name="demo_card4_title">Both Fail</string>
+    <string name="demo_card4_desc">Riverbed texture \u2014 defeats all VFI methods</string>
 
     <!-- File picker -->
     <string name="nnf_name">Name</string>

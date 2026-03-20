@@ -57,6 +57,7 @@
 #include "QNN/QnnInterface.h"
 #include "QNN/System/QnnSystemInterface.h"
 #include "QNN/HTP/QnnHtpPerfInfrastructure.h"
+#include "QNN/HTP/QnnHtpDevice.h"
 
 // Vulkan compute (GPU prealign + warp)
 #include <vulkan/vulkan.h>
@@ -1467,7 +1468,7 @@ static void *phase4_thread_fn(void *arg)
 // Section 7: QNN loader (dlopen, from bench_e2e_pipeline.cpp pattern)
 // ====================================================================
 
-#define QNN_DEFAULT_DIR "/data/data/is.xyz.mpv/files/anvil"
+#define QNN_DEFAULT_DIR "/data/data/com.nihildigit.anvildemo/files/anvil"
 #define QNN_CTX_BIN     "context.serialized.bin"
 #define QNN_MAX_TENSORS 4
 
@@ -1487,6 +1488,10 @@ struct qnn_state {
     Qnn_Tensor_t in_tensors[QNN_MAX_TENSORS];
     Qnn_Tensor_t out_tensors[QNN_MAX_TENSORS];
     uint32_t n_in, n_out;
+
+    // HTP perf profile
+    uint32_t power_config_id;
+    int power_config_set;  // 1 if we got a valid powerConfigId
 
     // Pre-allocated user-facing float32 I/O buffers (aliases to current slot)
     float *input_buf;    // H*W*6 float32 NHWC
@@ -1779,6 +1784,83 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
         MP_WARN(f, "QNN: graphRetrieve failed\n");
         free(binary);
         return -1;
+    }
+
+    // --- Set HTP performance profile ---
+    // Default: POWER_SAVER_MODE for sustained real-time playback.
+    // Override via env: ANVIL_HTP_PERF=burst|sustained|power_saver
+    {
+        QnnDevice_Infrastructure_t devInfra = NULL;
+        if (q->qnn.deviceGetInfrastructure &&
+            q->qnn.deviceGetInfrastructure(&devInfra) == QNN_SUCCESS && devInfra)
+        {
+            QnnHtpDevice_Infrastructure_t *htpInfra =
+                (QnnHtpDevice_Infrastructure_t *)devInfra;
+            if (htpInfra->perfInfra.createPowerConfigId &&
+                htpInfra->perfInfra.setPowerConfig)
+            {
+                if (htpInfra->perfInfra.createPowerConfigId(
+                        0, 0, &q->power_config_id) == QNN_SUCCESS)
+                {
+                    q->power_config_set = 1;
+
+                    // Select power mode from env or default to power_saver
+                    QnnHtpPerfInfrastructure_PowerMode_t mode =
+                        QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE;
+                    const char *perf_env = getenv("ANVIL_HTP_PERF");
+                    if (perf_env) {
+                        if (strcmp(perf_env, "burst") == 0)
+                            mode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+                        else if (strcmp(perf_env, "sustained") == 0)
+                            mode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN;
+                        else if (strcmp(perf_env, "power_saver") == 0)
+                            mode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE;
+                    }
+
+                    QnnHtpPerfInfrastructure_PowerConfig_t dcvsConfig;
+                    memset(&dcvsConfig, 0, sizeof(dcvsConfig));
+                    dcvsConfig.option =
+                        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+                    dcvsConfig.dcvsV3Config.contextId = q->power_config_id;
+                    dcvsConfig.dcvsV3Config.setDcvsEnable = 1;
+                    dcvsConfig.dcvsV3Config.dcvsEnable = 1;
+                    dcvsConfig.dcvsV3Config.powerMode = mode;
+                    dcvsConfig.dcvsV3Config.setSleepLatency = 1;
+                    dcvsConfig.dcvsV3Config.sleepLatency = 40;  // µs
+                    dcvsConfig.dcvsV3Config.setSleepDisable = 0;
+                    dcvsConfig.dcvsV3Config.setBusParams = 1;
+                    dcvsConfig.dcvsV3Config.busVoltageCornerMin =
+                        DCVS_VOLTAGE_VCORNER_SVS;
+                    dcvsConfig.dcvsV3Config.busVoltageCornerTarget =
+                        DCVS_VOLTAGE_VCORNER_SVS_PLUS;
+                    dcvsConfig.dcvsV3Config.busVoltageCornerMax =
+                        DCVS_VOLTAGE_VCORNER_NOM;
+                    dcvsConfig.dcvsV3Config.setCoreParams = 1;
+                    dcvsConfig.dcvsV3Config.coreVoltageCornerMin =
+                        DCVS_VOLTAGE_VCORNER_SVS;
+                    dcvsConfig.dcvsV3Config.coreVoltageCornerTarget =
+                        DCVS_VOLTAGE_VCORNER_SVS_PLUS;
+                    dcvsConfig.dcvsV3Config.coreVoltageCornerMax =
+                        DCVS_VOLTAGE_VCORNER_NOM;
+
+                    const QnnHtpPerfInfrastructure_PowerConfig_t *configs[] = {
+                        &dcvsConfig, NULL
+                    };
+                    Qnn_ErrorHandle_t perfErr =
+                        htpInfra->perfInfra.setPowerConfig(
+                            q->power_config_id, configs);
+
+                    const char *mode_name =
+                        (mode == QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE)
+                            ? "burst"
+                        : (mode == QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN)
+                            ? "sustained"
+                            : "power_saver";
+                    MP_INFO(f, "QNN: HTP perf profile = %s (err=0x%x)\n",
+                            mode_name, (unsigned)perfErr);
+                }
+            }
+        }
     }
 
     // Set up tensor arrays for both double-buffer slots

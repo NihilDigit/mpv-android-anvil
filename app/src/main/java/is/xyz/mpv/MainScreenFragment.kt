@@ -1,68 +1,35 @@
 package `is`.xyz.mpv
 
-import `is`.xyz.filepicker.DocumentPickerFragment
 import `is`.xyz.mpv.preferences.PreferenceActivity
 import `is`.xyz.mpv.databinding.FragmentMainScreenBinding
-import android.app.Activity
-import android.content.ActivityNotFoundException
 import android.content.Intent
-import android.content.res.Configuration
+import android.media.MediaExtractor
 import android.net.Uri
 import android.os.Bundle
-import android.preference.PreferenceManager
 import android.util.Log
 import android.view.View
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
-import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
+import java.io.File
+import java.io.FileOutputStream
 
 class MainScreenFragment : Fragment(R.layout.fragment_main_screen) {
     private lateinit var binding: FragmentMainScreenBinding
 
-    private lateinit var documentTreeOpener: ActivityResultLauncher<Uri?>
-    private lateinit var filePickerLauncher: ActivityResultLauncher<Intent>
     private lateinit var playerLauncher: ActivityResultLauncher<Intent>
-
-    private var firstRun = false
-    private var returningFromPlayer = false
-
-    private var prev = ""
-    private var prevData: String? = null
-    private var lastPath = ""
+    private lateinit var documentPicker: ActivityResultLauncher<Array<String>>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        firstRun = savedInstanceState == null
 
-        documentTreeOpener = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) {
-            it?.let { root ->
-                requireContext().contentResolver.takePersistableUriPermission(
-                    root, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                saveChoice("doc", root.toString())
-
-                val i = Intent(context, FilePickerActivity::class.java)
-                i.putExtra("skip", FilePickerActivity.DOC_PICKER)
-                i.putExtra("root", root.toString())
-                filePickerLauncher.launch(i)
-            }
-        }
-        filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            if (it.resultCode != Activity.RESULT_OK) {
-                return@registerForActivityResult
-            }
-            it.data?.getStringExtra("last_path")?.let { path ->
-                lastPath = path
-            }
-            it.data?.getStringExtra("path")?.let { path ->
-                playFile(path)
-            }
-        }
         playerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            // we don't care about the result but remember that we've been here
-            returningFromPlayer = true
             Log.v(TAG, "returned from player ($it)")
+        }
+
+        documentPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri?.let { validateAndPlay(it) }
         }
     }
 
@@ -71,50 +38,119 @@ class MainScreenFragment : Fragment(R.layout.fragment_main_screen) {
 
         Utils.handleInsetsAsPadding(binding.root)
 
-        binding.docBtn.setOnClickListener {
-            try {
-                documentTreeOpener.launch(null)
-            } catch (e: ActivityNotFoundException) {
-                // Android TV doesn't come with a document picker and certain versions just throw
-                // instead of handling this gracefully
-                binding.docBtn.isEnabled = false
-            }
+        // Demo video cards
+        binding.cardOldTownCross.setOnClickListener { playDemoVideo("old_town_cross.mp4") }
+        binding.cardCrowdRun.setOnClickListener { playDemoVideo("crowd_run.mp4") }
+        binding.cardTractor.setOnClickListener { playDemoVideo("tractor.mp4") }
+        binding.cardRiverbed.setOnClickListener { playDemoVideo("riverbed.mp4") }
+
+        // Load custom video
+        binding.loadCustomBtn.setOnClickListener {
+            documentPicker.launch(arrayOf("video/*"))
         }
-        binding.urlBtn.setOnClickListener {
-            saveChoice("url")
-            val helper = Utils.OpenUrlDialog(requireContext())
-            with (helper) {
-                builder.setPositiveButton(R.string.dialog_ok) { _, _ ->
-                    playFile(helper.text)
-                }
-                builder.setNegativeButton(R.string.dialog_cancel) { dialog, _ -> dialog.cancel() }
-                create().show()
-            }
-        }
-        binding.filepickerBtn.setOnClickListener {
-            saveChoice("file")
-            val i = Intent(context, FilePickerActivity::class.java)
-            i.putExtra("skip", FilePickerActivity.FILE_PICKER)
-            if (lastPath != "")
-                i.putExtra("default_path", lastPath)
-            filePickerLauncher.launch(i)
-        }
+
+        // Settings
         binding.settingsBtn.setOnClickListener {
-            saveChoice("") // will reset
             startActivity(Intent(context, PreferenceActivity::class.java))
         }
 
         if (BuildConfig.DEBUG) {
             binding.settingsBtn.setOnLongClickListener { showDebugMenu(); true }
         }
+    }
 
-        onConfigurationChanged(view.resources.configuration)
+    /**
+     * Copy a demo video from assets to internal storage (if needed) and launch the player.
+     */
+    private fun playDemoVideo(filename: String) {
+        val ctx = requireContext()
+        val demoDir = File(ctx.filesDir, "anvil/demo")
+        demoDir.mkdirs()
+        val destFile = File(demoDir, filename)
+
+        // Copy from assets if not already present
+        if (!destFile.exists() || destFile.length() == 0L) {
+            try {
+                ctx.assets.open("anvil/demo/$filename").use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to copy demo asset $filename", e)
+                return
+            }
+        }
+
+        playFile(destFile.absolutePath)
+    }
+
+    /**
+     * Validate that a user-picked video is H.264 1080p before launching.
+     */
+    private fun validateAndPlay(uri: Uri) {
+        val ctx = requireContext()
+        var codec = "unknown"
+        var width = 0
+        var height = 0
+
+        try {
+            val extractor = MediaExtractor()
+            extractor.setDataSource(ctx, uri, null)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/")) {
+                    codec = mime
+                    if (format.containsKey(android.media.MediaFormat.KEY_WIDTH))
+                        width = format.getInteger(android.media.MediaFormat.KEY_WIDTH)
+                    if (format.containsKey(android.media.MediaFormat.KEY_HEIGHT))
+                        height = format.getInteger(android.media.MediaFormat.KEY_HEIGHT)
+                    break
+                }
+            }
+            extractor.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to probe video", e)
+        }
+
+        val isH264 = codec == "video/avc"
+        val is1080p = (width == 1920 && height == 1080) || (width == 1080 && height == 1920)
+
+        if (!isH264 || !is1080p) {
+            val codecDisplay = when (codec) {
+                "video/avc" -> "H.264"
+                "video/hevc" -> "H.265"
+                "video/x-vnd.on2.vp9" -> "VP9"
+                "video/av01" -> "AV1"
+                else -> codec
+            }
+            AlertDialog.Builder(ctx)
+                .setTitle(R.string.demo_invalid_title)
+                .setMessage(getString(R.string.demo_invalid_msg, codecDisplay, width, height))
+                .setPositiveButton(R.string.dialog_ok, null)
+                .show()
+            return
+        }
+
+        // Launch via ACTION_VIEW with the content URI
+        val intent = Intent(Intent.ACTION_VIEW, uri)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        intent.setClass(ctx, MPVActivity::class.java)
+        playerLauncher.launch(intent)
+    }
+
+    private fun playFile(filepath: String) {
+        val intent = Intent()
+        intent.putExtra("filepath", filepath)
+        intent.setClass(requireContext(), MPVActivity::class.java)
+        playerLauncher.launch(intent)
     }
 
     private fun showDebugMenu() {
         assert(BuildConfig.DEBUG)
         val context = requireContext()
-        with (AlertDialog.Builder(context)) {
+        with(AlertDialog.Builder(context)) {
             setItems(DEBUG_ACTIVITIES) { dialog, idx ->
                 dialog.dismiss()
                 val intent = Intent(Intent.ACTION_MAIN)
@@ -125,89 +161,9 @@ class MainScreenFragment : Fragment(R.layout.fragment_main_screen) {
         }
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // phone screens are too small to show the action buttons alongside the logo
-        if (!Utils.isXLargeTablet(requireContext())) {
-            binding.logo.isVisible = newConfig.orientation != Configuration.ORIENTATION_LANDSCAPE
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (firstRun) {
-            restoreChoice()
-        } else if (returningFromPlayer) {
-            restoreChoice(prev, prevData)
-        }
-        firstRun = false
-        returningFromPlayer = false
-    }
-
-    private fun saveChoice(type: String, data: String? = null) {
-        if (prev != type)
-            lastPath = ""
-        prev = type
-        prevData = data
-
-        if (!binding.switch1.isChecked)
-            return
-        binding.switch1.isChecked = false
-        with (PreferenceManager.getDefaultSharedPreferences(requireContext()).edit()) {
-            putString("MainScreenFragment_remember", type)
-            if (data == null)
-                remove("MainScreenFragment_remember_data")
-            else
-                putString("MainScreenFragment_remember_data", data)
-            commit()
-        }
-    }
-
-    private fun restoreChoice() {
-        with (PreferenceManager.getDefaultSharedPreferences(requireContext())) {
-            restoreChoice(
-                getString("MainScreenFragment_remember", "") ?: "",
-                getString("MainScreenFragment_remember_data", "")
-            )
-        }
-    }
-
-    private fun restoreChoice(type: String, data: String?) {
-        when (type) {
-            "doc" -> {
-                val uri = Uri.parse(data)
-                // check that we can still access the folder
-                if (!DocumentPickerFragment.isTreeUsable(requireContext(), uri))
-                    return
-
-                val i = Intent(context, FilePickerActivity::class.java)
-                i.putExtra("skip", FilePickerActivity.DOC_PICKER)
-                i.putExtra("root", uri.toString())
-                if (lastPath != "")
-                    i.putExtra("default_path", lastPath)
-                filePickerLauncher.launch(i)
-            }
-            "url" -> binding.urlBtn.callOnClick()
-            "file" -> binding.filepickerBtn.callOnClick()
-        }
-    }
-
-    private fun playFile(filepath: String) {
-        val i: Intent
-        if (filepath.startsWith("content://")) {
-            i = Intent(Intent.ACTION_VIEW, Uri.parse(filepath))
-        } else {
-            i = Intent()
-            i.putExtra("filepath", filepath)
-        }
-        i.setClass(requireContext(), MPVActivity::class.java)
-        playerLauncher.launch(i)
-    }
-
     companion object {
         private const val TAG = "mpv"
 
-        // list of debug or testing activities that can be launched
         private val DEBUG_ACTIVITIES = arrayOf(
             "IntentTestActivity",
             "CodecInfoActivity"
