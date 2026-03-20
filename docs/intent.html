@@ -7,9 +7,9 @@
 <body>
 	<h2 id="intent">Intent</h2>
 
-	<p>You can use an intent to directly launch the player of mpv-android.</p>
+	<p>You can use an intent to directly launch the player of ANVIL VFI Demo.</p>
 
-	<p>package: <code>is.xyz.mpv</code><br>
+	<p>package: <code>com.nihildigit.anvildemo</code><br>
 	action: <code>android.intent.action.VIEW</code></p>
 	<ul>
 		<li>
@@ -26,7 +26,7 @@
 			data: URI with scheme <code>http, https</code> and file extension <code>mkv, mp4, webm, mov, flac, mp3, ogg, m3u, m3u8</code><br>
 		</li>
 	</ul>
-	<p>If you need to force an URL to be opened in mpv regardless of the file
+	<p>If you need to force an URL to be opened in ANVIL VFI Demo regardless of the file
 	extension set the MIME type to <code>video/any</code>.<br>
 	extras: <i>(all optional)</i></p>
 	<ul>
@@ -53,27 +53,27 @@
 		<h5>Kotlin</h5>
 		<pre>val intent = Intent(Intent.ACTION_VIEW)
 intent.setDataAndType(Uri.parse("https://example.org/media.png"), "video/any")
-intent.setPackage("is.xyz.mpv")
+intent.setPackage("com.nihildigit.anvildemo")
 val subtitle = Uri.parse("https://example.org/subtitle.srt")
 intent.putExtra("subs", arrayOf&lt;Uri&gt;(subtitle))
 startActivity(intent)</pre>
 		<h5>HTML (Chrome)</h5>
-		<pre>&lt;a href="intent://example.org/media.png#Intent;type=video/any;package=is.xyz.mpv;scheme=https;end;"&gt;Click me&lt;/a&gt;</pre>
+		<pre>&lt;a href="intent://example.org/media.png#Intent;type=video/any;package=com.nihildigit.anvildemo;scheme=https;end;"&gt;Click me&lt;/a&gt;</pre>
 		<h5>Command line (e.g. adb or Termux)</h5>
-		<pre>am start -a android.intent.action.VIEW -t video/any -p is.xyz.mpv -d "https://example.org/media.png" </pre>
+		<pre>am start -a android.intent.action.VIEW -t video/any -p com.nihildigit.anvildemo -d "https://example.org/media.png" </pre>
 		</div>
 	</details>
 
 	<h2 id="result-intent">Result Intent</h2>
 
-	<p>Once the activity exits mpv-android will deliver a result intent back to the invoker.<br>
+	<p>Once the activity exits ANVIL VFI Demo will deliver a result intent back to the invoker.<br>
 	action: <code>is.xyz.mpv.MPVActivity.result</code><br>
 	code:</p>
 	<ul>
 		<li><code>RESULT_CANCELED</code>: playback did not start due to an error</li>
 		<li><code>RESULT_OK</code>: playback ended normally or user exited</li>
 	</ul>
-	<p>data: the same URI mpv was launched with<br>
+	<p>data: the same URI the app was launched with<br>
 	extras:</p>
 	<ul>
 		<li><code>position</code> (Int): last playback position in milliseconds. not present if playback finished normally</li>

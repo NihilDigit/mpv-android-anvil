@@ -19,3 +19,5 @@ app/src/main/assets/anvil/libQnn*.so
 buildscripts/prefix/
 buildscripts/deps/
 buildscripts/sdk/
+bench_stress/logcat_raw.txt
+record_demo.sh

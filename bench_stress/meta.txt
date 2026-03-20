@@ -1,0 +1,10 @@
+=== Stress Test Start ===
+Device: OnePlus Ace5 (SM8650, HTP V75)
+Video: tractor.mp4, 1080p H.264 25fps, loop=inf
+Brightness: 50%, WiFi on, USB disconnected
+Start: 2026-03-20 18:34:12
+Baseline capacity: 100%
+Baseline charge: 5592000 µAh
+End: 2026-03-20 19:37:04
+End capacity: 82%
+End charge: 4479000 µAh
