@@ -209,13 +209,17 @@
     <string name="demo_invalid_title">Unsupported Video</string>
     <string name="demo_invalid_msg">ANVIL requires H.264 (AVC) codec at 1920\u00d71080 resolution.\n\nDetected: %1$s at %2$dx%3$d</string>
     <string name="demo_card1_title">ANVIL Wins</string>
-    <string name="demo_card1_desc">Regular pedestrian motion \u2014 MV prior excels</string>
+    <string name="demo_card1_badge">+0.6 dB</string>
+    <string name="demo_card1_desc">old_town_cross\nANVIL 31.1 / RIFE 30.5</string>
     <string name="demo_card2_title">Tie</string>
-    <string name="demo_card2_desc">Dense crowd running \u2014 both methods challenged</string>
+    <string name="demo_card2_badge">+0.7 dB</string>
+    <string name="demo_card2_desc">crowd_run\nANVIL 31.4 / RIFE 30.8</string>
     <string name="demo_card3_title">RIFE Wins</string>
-    <string name="demo_card3_desc">Large tractor \u2014 needs sub-pixel optical flow</string>
+    <string name="demo_card3_badge">\u22122.2 dB</string>
+    <string name="demo_card3_desc">tractor\nANVIL 27.9 / RIFE 30.1</string>
     <string name="demo_card4_title">Both Fail</string>
-    <string name="demo_card4_desc">Riverbed texture \u2014 defeats all VFI methods</string>
+    <string name="demo_card4_badge">~15 dB</string>
+    <string name="demo_card4_desc">riverbed\nANVIL 15.4 / RIFE 14.4</string>
 
     <!-- File picker -->
     <string name="nnf_name">Name</string>

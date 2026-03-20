@@ -21,3 +21,7 @@ buildscripts/deps/
 buildscripts/sdk/
 bench_stress/logcat_raw.txt
 record_demo.sh
+demo.mp4
+screen-*.mp4
+docs/demo.mp4
+bench_stress/logcat_ps.txt

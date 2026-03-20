@@ -4,9 +4,7 @@ Demo application for **ANVIL** (Accelerator-Native Video InterpoLation), a video
 
 > **Paper**: *ANVIL: Accelerator-Native Video InterpoLation for Mobile NPU Deployment* (under review)
 
-<p align="center">
-  <img src="docs/images/launcher.png" width="300" alt="ANVIL VFI Demo launcher">
-</p>
+https://github.com/user-attachments/assets/01a61b64-5a0a-4553-9d10-66b896afaf7a
 
 The demo includes 4 embedded Xiph test sequences representing different VFI scenarios (from our paper's visual comparison), plus a "Load Custom Video" option with H.264 1080p validation. A **VFI toggle button** in the player enables instant A/B comparison during playback.
 
