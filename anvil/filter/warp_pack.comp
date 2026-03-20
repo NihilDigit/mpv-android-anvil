@@ -1,0 +1,107 @@
+#version 450
+// Fused: upsample flow (1/4→full) + warp YUV + BT.709 yuv2rgb + blend
+// Output: float NHWC 6ch (warp0_rgb + warp1_rgb) + float blend RGB (3 planar)
+//
+// YUV planes are packed contiguously in each frame buffer as bytes:
+//   [Y plane: H*y_stride bytes] [U plane: H/2*uv_stride bytes] [V plane: H/2*uv_stride bytes]
+// Accessed as uint32 (4 bytes per element), byte-level access via shifts.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set=0, binding=0) readonly  buffer FlowX  { float flow_x[]; };
+layout(set=0, binding=1) readonly  buffer FlowY  { float flow_y[]; };
+layout(set=0, binding=2) readonly  buffer Prev   { uint prev_data[]; };
+layout(set=0, binding=3) readonly  buffer Curr   { uint curr_data[]; };
+layout(set=0, binding=4) writeonly buffer NhwcOut { float nhwc_out[]; }; // 6ch float
+layout(set=0, binding=5) writeonly buffer BlendR  { float blend_r[]; };
+layout(set=0, binding=6) writeonly buffer BlendG  { float blend_g[]; };
+layout(set=0, binding=7) writeonly buffer BlendB  { float blend_b[]; };
+
+layout(push_constant) uniform Params {
+    int W, H, sW, sH;
+    int y_stride, uv_stride;
+    int u_off, v_off;       // byte offsets to U and V planes
+};
+
+#define READ_BYTE_PREV(off) float((prev_data[(off)>>2] >> (((off)&3)*8)) & 0xFFu)
+#define READ_BYTE_CURR(off) float((curr_data[(off)>>2] >> (((off)&3)*8)) & 0xFFu)
+
+float bilerp4(float v00, float v10, float v01, float v11, float wx, float wy) {
+    return mix(mix(v00, v10, wx), mix(v01, v11, wx), wy);
+}
+
+vec3 sample_yuv_prev(float sx, float sy) {
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    int x1 = x0+1, y1 = y0+1;
+    float wx = sx-float(x0), wy = sy-float(y0);
+    x0=clamp(x0,0,W-1); x1=clamp(x1,0,W-1);
+    y0=clamp(y0,0,H-1); y1=clamp(y1,0,H-1);
+    float yv = bilerp4(READ_BYTE_PREV(y0*y_stride+x0), READ_BYTE_PREV(y0*y_stride+x1),
+                        READ_BYTE_PREV(y1*y_stride+x0), READ_BYTE_PREV(y1*y_stride+x1), wx, wy);
+    int cW=W>>1, cH=H>>1;
+    float csx=sx*0.5, csy=sy*0.5;
+    int cx0=clamp(int(floor(csx)),0,cW-1), cy0=clamp(int(floor(csy)),0,cH-1);
+    int cx1=clamp(cx0+1,0,cW-1), cy1=clamp(cy0+1,0,cH-1);
+    float cwx=csx-float(cx0), cwy=csy-float(cy0);
+    float uv = bilerp4(READ_BYTE_PREV(u_off+cy0*uv_stride+cx0), READ_BYTE_PREV(u_off+cy0*uv_stride+cx1),
+                        READ_BYTE_PREV(u_off+cy1*uv_stride+cx0), READ_BYTE_PREV(u_off+cy1*uv_stride+cx1), cwx, cwy);
+    float vv = bilerp4(READ_BYTE_PREV(v_off+cy0*uv_stride+cx0), READ_BYTE_PREV(v_off+cy0*uv_stride+cx1),
+                        READ_BYTE_PREV(v_off+cy1*uv_stride+cx0), READ_BYTE_PREV(v_off+cy1*uv_stride+cx1), cwx, cwy);
+    return vec3(yv, uv, vv);
+}
+
+vec3 sample_yuv_curr(float sx, float sy) {
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    int x1 = x0+1, y1 = y0+1;
+    float wx = sx-float(x0), wy = sy-float(y0);
+    x0=clamp(x0,0,W-1); x1=clamp(x1,0,W-1);
+    y0=clamp(y0,0,H-1); y1=clamp(y1,0,H-1);
+    float yv = bilerp4(READ_BYTE_CURR(y0*y_stride+x0), READ_BYTE_CURR(y0*y_stride+x1),
+                        READ_BYTE_CURR(y1*y_stride+x0), READ_BYTE_CURR(y1*y_stride+x1), wx, wy);
+    int cW=W>>1, cH=H>>1;
+    float csx=sx*0.5, csy=sy*0.5;
+    int cx0=clamp(int(floor(csx)),0,cW-1), cy0=clamp(int(floor(csy)),0,cH-1);
+    int cx1=clamp(cx0+1,0,cW-1), cy1=clamp(cy0+1,0,cH-1);
+    float cwx=csx-float(cx0), cwy=csy-float(cy0);
+    float uv = bilerp4(READ_BYTE_CURR(u_off+cy0*uv_stride+cx0), READ_BYTE_CURR(u_off+cy0*uv_stride+cx1),
+                        READ_BYTE_CURR(u_off+cy1*uv_stride+cx0), READ_BYTE_CURR(u_off+cy1*uv_stride+cx1), cwx, cwy);
+    float vv = bilerp4(READ_BYTE_CURR(v_off+cy0*uv_stride+cx0), READ_BYTE_CURR(v_off+cy0*uv_stride+cx1),
+                        READ_BYTE_CURR(v_off+cy1*uv_stride+cx0), READ_BYTE_CURR(v_off+cy1*uv_stride+cx1), cwx, cwy);
+    return vec3(yv, uv, vv);
+}
+
+vec3 yuv2rgb(vec3 yuv) {
+    float yf = (yuv.x - 16.0) / 219.0;
+    float uf = (yuv.y - 128.0) / 224.0;
+    float vf = (yuv.z - 128.0) / 224.0;
+    return clamp(vec3(yf + 1.5748*vf, yf - 0.1873*uf - 0.4681*vf, yf + 1.8556*uf), 0.0, 1.0);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= W || y >= H) return;
+
+    // Upsample flow from 1/4 res
+    float fsy = float(y)*float(sH)/float(H), fsx = float(x)*float(sW)/float(W);
+    int fx0=clamp(int(floor(fsx)),0,sW-1), fy0=clamp(int(floor(fsy)),0,sH-1);
+    int fx1=clamp(fx0+1,0,sW-1), fy1=clamp(fy0+1,0,sH-1);
+    float fwx=fsx-float(fx0), fwy=fsy-float(fy0);
+    float mvx = bilerp4(flow_x[fy0*sW+fx0],flow_x[fy0*sW+fx1],flow_x[fy1*sW+fx0],flow_x[fy1*sW+fx1],fwx,fwy);
+    float mvy = bilerp4(flow_y[fy0*sW+fx0],flow_y[fy0*sW+fx1],flow_y[fy1*sW+fx0],flow_y[fy1*sW+fx1],fwx,fwy);
+
+    // Warp + sample YUV + convert to RGB
+    vec3 rgb0 = yuv2rgb(sample_yuv_prev(float(x)-mvx*0.5, float(y)-mvy*0.5));
+    vec3 rgb1 = yuv2rgb(sample_yuv_curr(float(x)+mvx*0.5, float(y)+mvy*0.5));
+    vec3 blend = (rgb0 + rgb1) * 0.5;
+
+    int idx = y * W + x;
+    blend_r[idx] = blend.r;
+    blend_g[idx] = blend.g;
+    blend_b[idx] = blend.b;
+
+    // NHWC 6ch float output
+    int oi = idx * 6;
+    nhwc_out[oi+0]=rgb0.r; nhwc_out[oi+1]=rgb0.g; nhwc_out[oi+2]=rgb0.b;
+    nhwc_out[oi+3]=rgb1.r; nhwc_out[oi+4]=rgb1.g; nhwc_out[oi+5]=rgb1.b;
+}

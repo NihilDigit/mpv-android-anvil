@@ -1,0 +1,35 @@
+#version 450
+// Separable Gaussian blur σ=2 on a float buffer
+// Dispatched twice: once horizontal (dir=0), once vertical (dir=1)
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set=0, binding=0) readonly  buffer In  { float data_in[];  };
+layout(set=0, binding=1) writeonly buffer Out { float data_out[]; };
+
+layout(push_constant) uniform Params { int width, height, dir; };
+
+// Gaussian kernel σ=2, radius=6 (13 taps), pre-normalized
+const float kernel[13] = float[13](
+    0.00443, 0.01039, 0.02087, 0.03593, 0.05298, 0.06694, 0.07237,
+    0.06694, 0.05298, 0.03593, 0.02087, 0.01039, 0.00443
+);
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= width || y >= height) return;
+
+    float sum = 0.0;
+    for (int k = -6; k <= 6; k++) {
+        int sx, sy;
+        if (dir == 0) { // horizontal
+            sx = clamp(x + k, 0, width - 1);
+            sy = y;
+        } else { // vertical
+            sx = x;
+            sy = clamp(y + k, 0, height - 1);
+        }
+        sum += data_in[sy * width + sx] * kernel[k + 6];
+    }
+    data_out[y * width + x] = sum;
+}

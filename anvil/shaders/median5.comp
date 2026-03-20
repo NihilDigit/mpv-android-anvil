@@ -1,0 +1,36 @@
+#version 450
+// 5x5 median filter on a float buffer (1/4 resolution flow field)
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set=0, binding=0) readonly  buffer In  { float data_in[];  };
+layout(set=0, binding=1) writeonly buffer Out { float data_out[]; };
+
+layout(push_constant) uniform Params { int width, height; };
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= width || y >= height) return;
+
+    // Gather 5x5 neighborhood with clamped borders
+    float buf[25];
+    int cnt = 0;
+    for (int ky = -2; ky <= 2; ky++) {
+        int yy = clamp(y + ky, 0, height - 1);
+        for (int kx = -2; kx <= 2; kx++) {
+            int xx = clamp(x + kx, 0, width - 1);
+            buf[cnt++] = data_in[yy * width + xx];
+        }
+    }
+
+    // Partial selection sort to find median (index 12 of 25)
+    for (int i = 0; i <= 12; i++) {
+        int min_j = i;
+        for (int j = i + 1; j < 25; j++)
+            if (buf[j] < buf[min_j]) min_j = j;
+        if (min_j != i) {
+            float t = buf[i]; buf[i] = buf[min_j]; buf[min_j] = t;
+        }
+    }
+    data_out[y * width + x] = buf[12];
+}
