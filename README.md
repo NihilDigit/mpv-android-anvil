@@ -36,4 +36,32 @@ You can download mpv-android from the [Releases section](https://github.com/mpv-
 
 Take a look at the [README](buildscripts/README.md) inside the `buildscripts` directory.
 
+### Qualcomm QNN / QAIRT runtime setup
+
+This demo does not ship Qualcomm QAIRT/QNN runtime libraries in Git.
+You must provide them from a local Qualcomm AI Engine Direct (QAIRT) SDK install.
+
+Expected files:
+
+* `app/src/main/qnnLibs/arm64-v8a/libQnnHtp.so`
+* `app/src/main/qnnLibs/arm64-v8a/libQnnSystem.so`
+* `app/src/main/qnnLibs/arm64-v8a/libQnnHtpPrepare.so`
+* `app/src/main/qnnLibs/arm64-v8a/libQnnHtpV75Stub.so`
+* `app/src/main/assets/anvil/libQnnHtpV75Skel.so`
+
+Example setup:
+
+```sh
+export QAIRT_SDK_ROOT=/opt/qcom/aistack/qairt/<version>
+mkdir -p app/src/main/qnnLibs/arm64-v8a app/src/main/assets/anvil
+cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtp.so" app/src/main/qnnLibs/arm64-v8a/
+cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnSystem.so" app/src/main/qnnLibs/arm64-v8a/
+cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtpPrepare.so" app/src/main/qnnLibs/arm64-v8a/
+cp "$QAIRT_SDK_ROOT/lib/aarch64-android/libQnnHtpV75Stub.so" app/src/main/qnnLibs/arm64-v8a/
+cp "$QAIRT_SDK_ROOT/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so" app/src/main/assets/anvil/
+```
+
+`app/src/main/assets/anvil/context.serialized.bin` is still expected separately for the model context.
+The QNN/QAIRT `.so` files above are intentionally ignored by Git.
+
 Some other documentation can be found at this [link](http://mpv-android.github.io/mpv-android/).

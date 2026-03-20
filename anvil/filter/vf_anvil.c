@@ -9,12 +9,15 @@
  *
  * QNN HTP inference via dlopen (no subprocess).
  *
- * Pipeline (Vulkan GPU + HTP):
+ * Pipeline (Vulkan GPU + HTP, pipelined Phase B):
  *   Phase 1a (CPU, ~2ms): ZOH + downsample to 1/4 res → SSBO
  *   Phase 1b (GPU, ~2ms): median5 ×2 + gauss_sep ×4 (1/4 res flow)
  *   Phase 2  (GPU, ~3ms): warp_pack (upsample flow + warp YUV + yuv2rgb + blend + NHWC)
- *   Phase 3  (HTP, ~13ms): QNN graphExecute
- *   Phase 4  (CPU, ~3ms): dequant + residual + rgb2yuv (4 threads)
+ *   Phase 3  (HTP, ~13ms): QNN graphExecute [ASYNC — overlaps with downstream render]
+ *   Phase 4  (GPU or CPU, ~1-3ms): dequant + residual + rgb2yuv
+ *
+ * Phase B pipeline overlap: HTP runs in background thread while mpv renders
+ * the original frame. Double-buffered QNN I/O prevents data races.
  *
  * CPU fallback (ARM64 NEON + multi-threaded) used when Vulkan unavailable.
  *
@@ -62,6 +65,8 @@
 #include "median5_spv.h"
 #include "gauss_sep_spv.h"
 #include "warp_pack_spv.h"
+#include "warp_pack_quant_spv.h"
+#include "residual_yuv_spv.h"
 
 // ====================================================================
 // Section 2: Constants and thread configuration
@@ -96,6 +101,21 @@
 struct pc_median  { int32_t width, height; };
 struct pc_gauss   { int32_t width, height, dir; };
 struct pc_warp    { int32_t W, H, sW, sH, y_stride, uv_stride, u_off, v_off; };
+struct pc_warp_quant {
+    int32_t W, H, sW, sH, y_stride, uv_stride, u_off, v_off;
+    float inv_scale;
+    int32_t offset;
+};
+
+struct pc_residual_yuv {
+    int32_t W, H;
+    int32_t y_stride, uv_stride;
+    float in_scale;
+    int32_t in_offset;
+    float out_scale;
+    int32_t out_offset;
+    int32_t qnn_ok;
+};
 
 struct vk_compute {
     VkInstance instance;
@@ -136,6 +156,36 @@ struct vk_compute {
     VkBuffer blend_r_buf, blend_g_buf, blend_b_buf;
     VkDeviceMemory blend_r_mem, blend_g_mem, blend_b_mem;
     float *blend_r_ptr, *blend_g_ptr, *blend_b_ptr;
+
+    // Quantized warp pipeline (warp_pack_quant shader)
+    VkPipeline warp_quant_pipe;
+    VkPipelineLayout warp_quant_layout;
+    VkDescriptorSetLayout warp_quant_dsl;
+    VkDescriptorSet warp_quant_ds;
+
+    // uint8 NHWC output SSBO (packed into uint32, 3 words per 2 pixels)
+    VkBuffer nhwc_u8_buf;
+    VkDeviceMemory nhwc_u8_mem;
+    uint8_t *nhwc_u8_ptr;   // mapped pointer, cast to uint8_t for memcpy
+    VkDeviceSize nhwc_u8_size;
+
+    // Residual+YUV pipeline (Phase 4 on GPU)
+    VkPipeline residual_yuv_pipe;
+    VkPipelineLayout residual_yuv_layout;
+    VkDescriptorSetLayout residual_yuv_dsl;
+    VkDescriptorSet residual_yuv_ds;
+
+    // QNN output upload SSBO (uint8 NHWC 3ch, packed uint32)
+    VkBuffer qnn_out_buf;
+    VkDeviceMemory qnn_out_mem;
+    uint8_t *qnn_out_ptr;
+    VkDeviceSize qnn_out_size;
+
+    // YUV output SSBOs (Y, U, V planes)
+    VkBuffer y_buf, u_buf, v_buf;
+    VkDeviceMemory y_mem, u_mem, v_mem;
+    uint8_t *y_ptr, *u_ptr, *v_ptr;
+    VkDeviceSize y_size, u_size, v_size;
 
     int ready;
     int W, H, sW, sH;
@@ -348,6 +398,38 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
     };
     VK_CHECK(vkCreateDescriptorSetLayout(vk->device, &dslci_warp, NULL, &vk->warp_dsl), fail);
 
+    // Warp quant: 5 SSBOs (flow_x, flow_y, prev_yuv, curr_yuv, nhwc_u8)
+    VkDescriptorSetLayoutBinding warp_quant_bindings[5];
+    for (int i = 0; i < 5; i++) {
+        warp_quant_bindings[i] = (VkDescriptorSetLayoutBinding){
+            .binding = i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        };
+    }
+    VkDescriptorSetLayoutCreateInfo dslci_warp_quant = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 5, .pBindings = warp_quant_bindings,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(vk->device, &dslci_warp_quant, NULL, &vk->warp_quant_dsl), fail);
+
+    // Residual+YUV: 5 SSBOs (nhwc_in, qnn_out, y_out, u_out, v_out)
+    VkDescriptorSetLayoutBinding residual_yuv_bindings[5];
+    for (int i = 0; i < 5; i++) {
+        residual_yuv_bindings[i] = (VkDescriptorSetLayoutBinding){
+            .binding = i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        };
+    }
+    VkDescriptorSetLayoutCreateInfo dslci_residual_yuv = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 5, .pBindings = residual_yuv_bindings,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(vk->device, &dslci_residual_yuv, NULL, &vk->residual_yuv_dsl), fail);
+
     // --- Pipeline layouts (with push constants) ---
     VkPushConstantRange pc_med = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -382,6 +464,28 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
     };
     VK_CHECK(vkCreatePipelineLayout(vk->device, &plci_warp, NULL, &vk->warp_layout), fail);
 
+    VkPushConstantRange pc_warp_quant = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0, .size = sizeof(struct pc_warp_quant),
+    };
+    VkPipelineLayoutCreateInfo plci_warp_quant = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &vk->warp_quant_dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_warp_quant,
+    };
+    VK_CHECK(vkCreatePipelineLayout(vk->device, &plci_warp_quant, NULL, &vk->warp_quant_layout), fail);
+
+    VkPushConstantRange pc_residual_yuv = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0, .size = sizeof(struct pc_residual_yuv),
+    };
+    VkPipelineLayoutCreateInfo plci_residual_yuv = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &vk->residual_yuv_dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pc_residual_yuv,
+    };
+    VK_CHECK(vkCreatePipelineLayout(vk->device, &plci_residual_yuv, NULL, &vk->residual_yuv_layout), fail);
+
     // --- Compute pipelines ---
     vk->median_pipe = vk_create_pipeline(vk->device, vk->median_layout,
                                           median5_spv, median5_spv_len);
@@ -389,7 +493,12 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
                                           gauss_sep_spv, gauss_sep_spv_len);
     vk->warp_pipe   = vk_create_pipeline(vk->device, vk->warp_layout,
                                           warp_pack_spv, warp_pack_spv_len);
-    if (!vk->median_pipe || !vk->gauss_pipe || !vk->warp_pipe) {
+    vk->warp_quant_pipe = vk_create_pipeline(vk->device, vk->warp_quant_layout,
+                                              warp_pack_quant_spv, warp_pack_quant_spv_len);
+    vk->residual_yuv_pipe = vk_create_pipeline(vk->device, vk->residual_yuv_layout,
+                                                residual_yuv_spv, residual_yuv_spv_len);
+    if (!vk->median_pipe || !vk->gauss_pipe || !vk->warp_pipe || !vk->warp_quant_pipe
+        || !vk->residual_yuv_pipe) {
         MP_WARN(f, "Vulkan: pipeline creation failed\n");
         goto fail;
     }
@@ -431,15 +540,44 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
         goto fail;
     }
 
+    // uint8 NHWC 6ch SSBO for quantized warp output (packed into uint32: 3 words per 2 pixels)
+    vk->nhwc_u8_size = (VkDeviceSize)(((W * H * 6) + 3) / 4) * 4;  // round up to uint32
+    if (vk_create_ssbo(vk->device, vk->physDev, &vk->nhwc_u8_buf, &vk->nhwc_u8_mem,
+                        (void **)&vk->nhwc_u8_ptr, vk->nhwc_u8_size) < 0)
+    {
+        MP_WARN(f, "Vulkan: nhwc_u8 SSBO allocation failed\n");
+        goto fail;
+    }
+
+    // QNN output upload SSBO (uint8 NHWC 3ch)
+    vk->qnn_out_size = (VkDeviceSize)(((W * H * 3) + 3) / 4) * 4;
+    // YUV output SSBOs
+    vk->y_size = (VkDeviceSize)(((W * H) + 3) / 4) * 4;
+    vk->u_size = (VkDeviceSize)((((W / 2) * (H / 2)) + 3) / 4) * 4;
+    vk->v_size = vk->u_size;
+    if (vk_create_ssbo(vk->device, vk->physDev, &vk->qnn_out_buf, &vk->qnn_out_mem,
+                        (void **)&vk->qnn_out_ptr, vk->qnn_out_size) < 0 ||
+        vk_create_ssbo(vk->device, vk->physDev, &vk->y_buf, &vk->y_mem,
+                        (void **)&vk->y_ptr, vk->y_size) < 0 ||
+        vk_create_ssbo(vk->device, vk->physDev, &vk->u_buf, &vk->u_mem,
+                        (void **)&vk->u_ptr, vk->u_size) < 0 ||
+        vk_create_ssbo(vk->device, vk->physDev, &vk->v_buf, &vk->v_mem,
+                        (void **)&vk->v_ptr, vk->v_size) < 0)
+    {
+        MP_WARN(f, "Vulkan: residual_yuv SSBO allocation failed\n");
+        goto fail;
+    }
+
     // --- Descriptor pool ---
-    // 2 median (2 SSBO each) + 4 gauss (2 SSBO each) + 1 warp (8 SSBO) = 20 descriptors, 7 sets
+    // 2 median (2 SSBO each) + 4 gauss (2 SSBO each) + 1 warp (8 SSBO) + 1 warp_quant (5 SSBO)
+    // + 1 residual_yuv (5 SSBO) = 30 descriptors, 9 sets
     VkDescriptorPoolSize poolSize = {
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 20,
+        .descriptorCount = 30,
     };
     VkDescriptorPoolCreateInfo dpci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 7,
+        .maxSets = 9,
         .poolSizeCount = 1, .pPoolSizes = &poolSize,
     };
     VK_CHECK(vkCreateDescriptorPool(vk->device, &dpci, NULL, &vk->dpool), fail);
@@ -475,6 +613,24 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
         };
         VK_CHECK(vkAllocateDescriptorSets(vk->device, &ai, &vk->warp_ds), fail);
     }
+    // 1 warp_quant set
+    {
+        VkDescriptorSetAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = vk->dpool,
+            .descriptorSetCount = 1, .pSetLayouts = &vk->warp_quant_dsl,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(vk->device, &ai, &vk->warp_quant_ds), fail);
+    }
+    // 1 residual_yuv set
+    {
+        VkDescriptorSetAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = vk->dpool,
+            .descriptorSetCount = 1, .pSetLayouts = &vk->residual_yuv_dsl,
+        };
+        VK_CHECK(vkAllocateDescriptorSets(vk->device, &ai, &vk->residual_yuv_ds), fail);
+    }
 
     // --- Bind SSBOs to descriptor sets ---
     // median_ds[0]: fx: sm_fx_a(in) -> sm_fx_b(out)
@@ -506,6 +662,20 @@ static int vk_init(struct vk_compute *vk, struct mp_filter *f, int W, int H)
     vk_write_ds_ssbo(vk->device, vk->warp_ds, 5, vk->blend_r_buf, px_size);
     vk_write_ds_ssbo(vk->device, vk->warp_ds, 6, vk->blend_g_buf, px_size);
     vk_write_ds_ssbo(vk->device, vk->warp_ds, 7, vk->blend_b_buf, px_size);
+
+    // warp_quant_ds: reads same flow/yuv, writes nhwc_u8
+    vk_write_ds_ssbo(vk->device, vk->warp_quant_ds, 0, vk->sm_fx_b, sm_size);  // flow_x
+    vk_write_ds_ssbo(vk->device, vk->warp_quant_ds, 1, vk->sm_fy_b, sm_size);  // flow_y
+    vk_write_ds_ssbo(vk->device, vk->warp_quant_ds, 2, vk->prev_yuv_buf, yuv_size);
+    vk_write_ds_ssbo(vk->device, vk->warp_quant_ds, 3, vk->curr_yuv_buf, yuv_size);
+    vk_write_ds_ssbo(vk->device, vk->warp_quant_ds, 4, vk->nhwc_u8_buf, vk->nhwc_u8_size);
+
+    // residual_yuv_ds: reads nhwc_u8 (blend input) + qnn_out, writes Y/U/V
+    vk_write_ds_ssbo(vk->device, vk->residual_yuv_ds, 0, vk->nhwc_u8_buf, vk->nhwc_u8_size);
+    vk_write_ds_ssbo(vk->device, vk->residual_yuv_ds, 1, vk->qnn_out_buf, vk->qnn_out_size);
+    vk_write_ds_ssbo(vk->device, vk->residual_yuv_ds, 2, vk->y_buf, vk->y_size);
+    vk_write_ds_ssbo(vk->device, vk->residual_yuv_ds, 3, vk->u_buf, vk->u_size);
+    vk_write_ds_ssbo(vk->device, vk->residual_yuv_ds, 4, vk->v_buf, vk->v_size);
 
     vk->ready = 1;
 
@@ -545,8 +715,10 @@ static void vk_pack_yuv(uint8_t *dst, const uint8_t *Y, int ys,
 }
 
 // Record and submit the GPU command buffer for Phase 1b + Phase 2
+// use_quant: 0 = float warp (warp_pack), 1 = uint8 quantized warp (warp_pack_quant)
 static void vk_dispatch(struct vk_compute *vk, int y_stride, int uv_stride,
-                         int u_off, int v_off)
+                         int u_off, int v_off,
+                         int use_quant, float inv_scale, int offset)
 {
     VkCommandBufferBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -650,22 +822,95 @@ static void vk_dispatch(struct vk_compute *vk, int y_stride, int uv_stride,
         0, 1, &compute_barrier, 0, NULL, 0, NULL);
 
     // --- Warp+pack: full resolution ---
-    struct pc_warp pcw = {
-        .W = vk->W, .H = vk->H, .sW = vk->sW, .sH = vk->sH,
-        .y_stride = y_stride, .uv_stride = uv_stride,
-        .u_off = u_off, .v_off = v_off,
-    };
-    uint32_t gx_warp = (vk->W + 15) / 16;
-    uint32_t gy_warp = (vk->H + 15) / 16;
+    if (use_quant) {
+        // Quantized path: warp_pack_quant shader outputs uint8 NHWC
+        struct pc_warp_quant pcwq = {
+            .W = vk->W, .H = vk->H, .sW = vk->sW, .sH = vk->sH,
+            .y_stride = y_stride, .uv_stride = uv_stride,
+            .u_off = u_off, .v_off = v_off,
+            .inv_scale = inv_scale, .offset = offset,
+        };
+        // Each invocation handles 2 pixels; workgroup is (8,16,1)
+        uint32_t gx_wq = ((vk->W / 2) + 7) / 8;
+        uint32_t gy_wq = (vk->H + 15) / 16;
 
-    vkCmdBindPipeline(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->warp_pipe);
-    vkCmdBindDescriptorSets(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        vk->warp_layout, 0, 1, &vk->warp_ds, 0, NULL);
-    vkCmdPushConstants(vk->cmd, vk->warp_layout,
-        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), &pcw);
-    vkCmdDispatch(vk->cmd, gx_warp, gy_warp, 1);
+        vkCmdBindPipeline(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->warp_quant_pipe);
+        vkCmdBindDescriptorSets(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            vk->warp_quant_layout, 0, 1, &vk->warp_quant_ds, 0, NULL);
+        vkCmdPushConstants(vk->cmd, vk->warp_quant_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcwq), &pcwq);
+        vkCmdDispatch(vk->cmd, gx_wq, gy_wq, 1);
+    } else {
+        // Float path: warp_pack shader outputs float NHWC + blend
+        struct pc_warp pcw = {
+            .W = vk->W, .H = vk->H, .sW = vk->sW, .sH = vk->sH,
+            .y_stride = y_stride, .uv_stride = uv_stride,
+            .u_off = u_off, .v_off = v_off,
+        };
+        uint32_t gx_warp = (vk->W + 15) / 16;
+        uint32_t gy_warp = (vk->H + 15) / 16;
+
+        vkCmdBindPipeline(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->warp_pipe);
+        vkCmdBindDescriptorSets(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            vk->warp_layout, 0, 1, &vk->warp_ds, 0, NULL);
+        vkCmdPushConstants(vk->cmd, vk->warp_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), &pcw);
+        vkCmdDispatch(vk->cmd, gx_warp, gy_warp, 1);
+    }
 
     // Final barrier: GPU writes visible to host
+    VkMemoryBarrier host_barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+    };
+    vkCmdPipelineBarrier(vk->cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &host_barrier, 0, NULL, 0, NULL);
+
+    vkEndCommandBuffer(vk->cmd);
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1, .pCommandBuffers = &vk->cmd,
+    };
+    vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->queue);
+}
+
+// Record and submit the GPU command buffer for Phase 4 residual+YUV conversion
+static void vk_dispatch_residual_yuv(struct vk_compute *vk, struct pc_residual_yuv *pc)
+{
+    vkResetCommandBuffer(vk->cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(vk->cmd, &beginInfo);
+
+    // Host->shader barrier (input data was written via memcpy)
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(vk->cmd,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+
+    vkCmdBindPipeline(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->residual_yuv_pipe);
+    vkCmdBindDescriptorSets(vk->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        vk->residual_yuv_layout, 0, 1, &vk->residual_yuv_ds, 0, NULL);
+    vkCmdPushConstants(vk->cmd, vk->residual_yuv_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*pc), pc);
+
+    // local_size_x=16, local_size_y=8; each invocation handles one 2x2 chroma block
+    uint32_t gx = ((pc->W / 2) + 15) / 16;
+    uint32_t gy = ((pc->H / 2) + 7) / 8;
+    vkCmdDispatch(vk->cmd, gx, gy, 1);
+
+    // Shader->host barrier
     VkMemoryBarrier host_barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
@@ -693,12 +938,18 @@ static void vk_cleanup(struct vk_compute *vk)
     if (vk->median_pipe)  vkDestroyPipeline(vk->device, vk->median_pipe, NULL);
     if (vk->gauss_pipe)   vkDestroyPipeline(vk->device, vk->gauss_pipe, NULL);
     if (vk->warp_pipe)    vkDestroyPipeline(vk->device, vk->warp_pipe, NULL);
+    if (vk->warp_quant_pipe) vkDestroyPipeline(vk->device, vk->warp_quant_pipe, NULL);
+    if (vk->residual_yuv_pipe) vkDestroyPipeline(vk->device, vk->residual_yuv_pipe, NULL);
     if (vk->median_layout) vkDestroyPipelineLayout(vk->device, vk->median_layout, NULL);
     if (vk->gauss_layout)  vkDestroyPipelineLayout(vk->device, vk->gauss_layout, NULL);
     if (vk->warp_layout)   vkDestroyPipelineLayout(vk->device, vk->warp_layout, NULL);
+    if (vk->warp_quant_layout) vkDestroyPipelineLayout(vk->device, vk->warp_quant_layout, NULL);
+    if (vk->residual_yuv_layout) vkDestroyPipelineLayout(vk->device, vk->residual_yuv_layout, NULL);
     if (vk->median_dsl)   vkDestroyDescriptorSetLayout(vk->device, vk->median_dsl, NULL);
     if (vk->gauss_dsl)    vkDestroyDescriptorSetLayout(vk->device, vk->gauss_dsl, NULL);
     if (vk->warp_dsl)     vkDestroyDescriptorSetLayout(vk->device, vk->warp_dsl, NULL);
+    if (vk->warp_quant_dsl) vkDestroyDescriptorSetLayout(vk->device, vk->warp_quant_dsl, NULL);
+    if (vk->residual_yuv_dsl) vkDestroyDescriptorSetLayout(vk->device, vk->residual_yuv_dsl, NULL);
     if (vk->dpool)        vkDestroyDescriptorPool(vk->device, vk->dpool, NULL);
     if (vk->cmdPool)      vkDestroyCommandPool(vk->device, vk->cmdPool, NULL);
 
@@ -712,6 +963,11 @@ static void vk_cleanup(struct vk_compute *vk)
     vk_free_ssbo(vk->device, vk->blend_r_buf, vk->blend_r_mem);
     vk_free_ssbo(vk->device, vk->blend_g_buf, vk->blend_g_mem);
     vk_free_ssbo(vk->device, vk->blend_b_buf, vk->blend_b_mem);
+    vk_free_ssbo(vk->device, vk->nhwc_u8_buf, vk->nhwc_u8_mem);
+    vk_free_ssbo(vk->device, vk->qnn_out_buf, vk->qnn_out_mem);
+    vk_free_ssbo(vk->device, vk->y_buf, vk->y_mem);
+    vk_free_ssbo(vk->device, vk->u_buf, vk->u_mem);
+    vk_free_ssbo(vk->device, vk->v_buf, vk->v_mem);
 
     vkDestroyDevice(vk->device, NULL);
     if (vk->instance) vkDestroyInstance(vk->instance, NULL);
@@ -981,8 +1237,13 @@ struct phase4_args {
     int y_start, y_end;
     int W, H;
 
-    // Blend from Phase 2
+    // Blend from Phase 2 (NULL when GPU quantized path — derive from nhwc_quant)
     const float *blend_r, *blend_g, *blend_b;
+
+    // GPU quantized path: derive blend inline from QNN uint8 input buffer
+    const uint8_t *nhwc_quant;  // non-NULL = GPU quantized path
+    float in_scale;
+    int32_t in_offset;
 
     // QNN output (quantized or float NHWC 3ch)
     const uint8_t *out_quant_buf;
@@ -1061,9 +1322,25 @@ static void *phase4_thread_fn(void *arg)
 
         for (int x = 0; x < W; x++) {
             int idx = y * W + x;
-            float br = a->blend_r[idx];
-            float bg = a->blend_g[idx];
-            float bbb = a->blend_b[idx];
+            float br, bg, bbb;
+
+            if (a->nhwc_quant) {
+                // GPU quantized path: derive blend from uint8 NHWC input buffer
+                const uint8_t *qp = a->nhwc_quant + idx * 6;
+                float r0 = a->in_scale * ((float)qp[0] + (float)a->in_offset);
+                float g0 = a->in_scale * ((float)qp[1] + (float)a->in_offset);
+                float b0 = a->in_scale * ((float)qp[2] + (float)a->in_offset);
+                float r1 = a->in_scale * ((float)qp[3] + (float)a->in_offset);
+                float g1 = a->in_scale * ((float)qp[4] + (float)a->in_offset);
+                float b1 = a->in_scale * ((float)qp[5] + (float)a->in_offset);
+                br  = (r0 + r1) * 0.5f;
+                bg  = (g0 + g1) * 0.5f;
+                bbb = (b0 + b1) * 0.5f;
+            } else {
+                br  = a->blend_r[idx];
+                bg  = a->blend_g[idx];
+                bbb = a->blend_b[idx];
+            }
 
             // Add QNN residual if available
             if (a->qnn_ok) {
@@ -1126,9 +1403,23 @@ static void *phase4_thread_fn(void *arg)
                 // Previous row (y-1): re-derive from blend+residual
                 for (int dx = 0; dx < 2; dx++) {
                     int pidx = prev_y * W + cx * 2 + dx;
-                    float pr = a->blend_r[pidx];
-                    float pg = a->blend_g[pidx];
-                    float pb = a->blend_b[pidx];
+                    float pr, pg, pb;
+                    if (a->nhwc_quant) {
+                        const uint8_t *iq = a->nhwc_quant + pidx * 6;
+                        float r0 = a->in_scale * ((float)iq[0] + (float)a->in_offset);
+                        float g0 = a->in_scale * ((float)iq[1] + (float)a->in_offset);
+                        float b0 = a->in_scale * ((float)iq[2] + (float)a->in_offset);
+                        float r1 = a->in_scale * ((float)iq[3] + (float)a->in_offset);
+                        float g1 = a->in_scale * ((float)iq[4] + (float)a->in_offset);
+                        float b1 = a->in_scale * ((float)iq[5] + (float)a->in_offset);
+                        pr = (r0 + r1) * 0.5f;
+                        pg = (g0 + g1) * 0.5f;
+                        pb = (b0 + b1) * 0.5f;
+                    } else {
+                        pr = a->blend_r[pidx];
+                        pg = a->blend_g[pidx];
+                        pb = a->blend_b[pidx];
+                    }
                     if (a->qnn_ok) {
                         if (a->output_quantized) {
                             const uint8_t *qp = a->out_quant_buf + pidx * 3;
@@ -1192,12 +1483,12 @@ struct qnn_state {
     Qnn_GraphHandle_t graph;
     QnnSystemContext_Handle_t sys_ctx;
 
-    // I/O tensor arrays for graphExecute
+    // I/O tensor arrays for graphExecute (aliases to current double-buffer slot)
     Qnn_Tensor_t in_tensors[QNN_MAX_TENSORS];
     Qnn_Tensor_t out_tensors[QNN_MAX_TENSORS];
     uint32_t n_in, n_out;
 
-    // Pre-allocated user-facing float32 I/O buffers
+    // Pre-allocated user-facing float32 I/O buffers (aliases to current slot)
     float *input_buf;    // H*W*6 float32 NHWC
     float *output_buf;   // H*W*3 float32 NHWC
     uint32_t in_elems, out_elems;   // total element count
@@ -1207,8 +1498,17 @@ struct qnn_state {
     int output_is_quantized;  // 1 if output tensor is uint8 quantized
     float in_scale, out_scale;
     int32_t in_offset, out_offset;
-    uint8_t *in_quant_buf;    // uint8 buffer for graphExecute input
-    uint8_t *out_quant_buf;   // uint8 buffer for graphExecute output
+    uint8_t *in_quant_buf;    // uint8 buffer for graphExecute input (alias)
+    uint8_t *out_quant_buf;   // uint8 buffer for graphExecute output (alias)
+
+    // Double-buffer for pipeline parallelism (Phase B)
+    int buf_idx;                          // current buffer index (0 or 1)
+    uint8_t  *in_quant_buf_db[2];         // uint8 NHWC input per buffer
+    uint8_t  *out_quant_buf_db[2];        // uint8 NHWC output per buffer
+    float    *input_buf_db[2];            // float NHWC input per buffer
+    float    *output_buf_db[2];           // float NHWC output per buffer
+    Qnn_Tensor_t in_tensors_db[2][QNN_MAX_TENSORS];
+    Qnn_Tensor_t out_tensors_db[2][QNN_MAX_TENSORS];
 
     int ready;
 };
@@ -1443,20 +1743,24 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
                 (unsigned)out_dt, q->out_scale, (int)q->out_offset);
     }
 
-    // Allocate buffers
-    // For quantized input: only need uint8 buffer (Phase 2 writes directly)
-    // For float input: only need float buffer (Phase 2 writes directly)
-    // For quantized output: only need uint8 buffer (Phase 4 reads directly)
-    // We still allocate float buffers for non-quantized paths.
-    if (!q->input_is_quantized)
-        q->input_buf = (float *)calloc(q->in_elems, sizeof(float));
-    if (!q->output_is_quantized)
-        q->output_buf = (float *)calloc(q->out_elems, sizeof(float));
-
-    if (q->input_is_quantized)
-        q->in_quant_buf = (uint8_t *)calloc(q->in_elems, sizeof(uint8_t));
-    if (q->output_is_quantized)
-        q->out_quant_buf = (uint8_t *)calloc(q->out_elems, sizeof(uint8_t));
+    // Allocate double-buffered I/O for pipeline parallelism (Phase B).
+    // Each slot has its own input/output buffers and tensor arrays.
+    for (int db = 0; db < 2; db++) {
+        if (!q->input_is_quantized)
+            q->input_buf_db[db] = (float *)calloc(q->in_elems, sizeof(float));
+        if (!q->output_is_quantized)
+            q->output_buf_db[db] = (float *)calloc(q->out_elems, sizeof(float));
+        if (q->input_is_quantized)
+            q->in_quant_buf_db[db] = (uint8_t *)calloc(q->in_elems, sizeof(uint8_t));
+        if (q->output_is_quantized)
+            q->out_quant_buf_db[db] = (uint8_t *)calloc(q->out_elems, sizeof(uint8_t));
+    }
+    // Set initial aliases to slot 0
+    q->buf_idx = 0;
+    q->input_buf     = q->input_buf_db[0];
+    q->output_buf    = q->output_buf_db[0];
+    q->in_quant_buf  = q->in_quant_buf_db[0];
+    q->out_quant_buf = q->out_quant_buf_db[0];
 
     // Load context from binary
     Qnn_ErrorHandle_t ctx_err = q->qnn.contextCreateFromBinary(
@@ -1477,46 +1781,51 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
         return -1;
     }
 
-    // Set up tensor arrays pointing to our buffers
-    uint32_t in_off_bytes = 0;
-    for (uint32_t i = 0; i < q->n_in && i < QNN_MAX_TENSORS; i++) {
-        q->in_tensors[i] = meta_inputs[i];
-        q->in_tensors[i].v1.memType = QNN_TENSORMEMTYPE_RAW;
-        uint32_t elem = 1;
-        for (uint32_t d = 0; d < q->in_tensors[i].v1.rank; d++)
-            elem *= q->in_tensors[i].v1.dimensions[d];
-        if (q->input_is_quantized) {
-            uint32_t sz = elem * sizeof(uint8_t);
-            q->in_tensors[i].v1.clientBuf.data = q->in_quant_buf + in_off_bytes;
-            q->in_tensors[i].v1.clientBuf.dataSize = sz;
-            in_off_bytes += sz;
-        } else {
-            uint32_t sz = elem * sizeof(float);
-            q->in_tensors[i].v1.clientBuf.data = (uint8_t *)q->input_buf + in_off_bytes;
-            q->in_tensors[i].v1.clientBuf.dataSize = sz;
-            in_off_bytes += sz;
+    // Set up tensor arrays for both double-buffer slots
+    for (int db = 0; db < 2; db++) {
+        uint32_t in_off_bytes = 0;
+        for (uint32_t i = 0; i < q->n_in && i < QNN_MAX_TENSORS; i++) {
+            q->in_tensors_db[db][i] = meta_inputs[i];
+            q->in_tensors_db[db][i].v1.memType = QNN_TENSORMEMTYPE_RAW;
+            uint32_t elem = 1;
+            for (uint32_t d = 0; d < q->in_tensors_db[db][i].v1.rank; d++)
+                elem *= q->in_tensors_db[db][i].v1.dimensions[d];
+            if (q->input_is_quantized) {
+                uint32_t sz = elem * sizeof(uint8_t);
+                q->in_tensors_db[db][i].v1.clientBuf.data = q->in_quant_buf_db[db] + in_off_bytes;
+                q->in_tensors_db[db][i].v1.clientBuf.dataSize = sz;
+                in_off_bytes += sz;
+            } else {
+                uint32_t sz = elem * sizeof(float);
+                q->in_tensors_db[db][i].v1.clientBuf.data = (uint8_t *)q->input_buf_db[db] + in_off_bytes;
+                q->in_tensors_db[db][i].v1.clientBuf.dataSize = sz;
+                in_off_bytes += sz;
+            }
         }
-    }
 
-    uint32_t out_off_bytes = 0;
-    for (uint32_t i = 0; i < q->n_out && i < QNN_MAX_TENSORS; i++) {
-        q->out_tensors[i] = meta_outputs[i];
-        q->out_tensors[i].v1.memType = QNN_TENSORMEMTYPE_RAW;
-        uint32_t elem = 1;
-        for (uint32_t d = 0; d < q->out_tensors[i].v1.rank; d++)
-            elem *= q->out_tensors[i].v1.dimensions[d];
-        if (q->output_is_quantized) {
-            uint32_t sz = elem * sizeof(uint8_t);
-            q->out_tensors[i].v1.clientBuf.data = q->out_quant_buf + out_off_bytes;
-            q->out_tensors[i].v1.clientBuf.dataSize = sz;
-            out_off_bytes += sz;
-        } else {
-            uint32_t sz = elem * sizeof(float);
-            q->out_tensors[i].v1.clientBuf.data = (uint8_t *)q->output_buf + out_off_bytes;
-            q->out_tensors[i].v1.clientBuf.dataSize = sz;
-            out_off_bytes += sz;
+        uint32_t out_off_bytes = 0;
+        for (uint32_t i = 0; i < q->n_out && i < QNN_MAX_TENSORS; i++) {
+            q->out_tensors_db[db][i] = meta_outputs[i];
+            q->out_tensors_db[db][i].v1.memType = QNN_TENSORMEMTYPE_RAW;
+            uint32_t elem = 1;
+            for (uint32_t d = 0; d < q->out_tensors_db[db][i].v1.rank; d++)
+                elem *= q->out_tensors_db[db][i].v1.dimensions[d];
+            if (q->output_is_quantized) {
+                uint32_t sz = elem * sizeof(uint8_t);
+                q->out_tensors_db[db][i].v1.clientBuf.data = q->out_quant_buf_db[db] + out_off_bytes;
+                q->out_tensors_db[db][i].v1.clientBuf.dataSize = sz;
+                out_off_bytes += sz;
+            } else {
+                uint32_t sz = elem * sizeof(float);
+                q->out_tensors_db[db][i].v1.clientBuf.data = (uint8_t *)q->output_buf_db[db] + out_off_bytes;
+                q->out_tensors_db[db][i].v1.clientBuf.dataSize = sz;
+                out_off_bytes += sz;
+            }
         }
     }
+    // Initialize active tensors from slot 0
+    memcpy(q->in_tensors,  q->in_tensors_db[0],  sizeof(q->in_tensors));
+    memcpy(q->out_tensors, q->out_tensors_db[0], sizeof(q->out_tensors));
 
     free(binary);
     q->ready = 1;
@@ -1525,7 +1834,20 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
     return 0;
 }
 
-// Execute QNN graph. For quantized models, Phase 2 already wrote in_quant_buf
+// Switch active double-buffer slot: update aliases to point to slot `idx`
+static void qnn_switch_buffer(struct qnn_state *q, int idx)
+{
+    q->buf_idx = idx;
+    q->in_quant_buf  = q->in_quant_buf_db[idx];
+    q->out_quant_buf = q->out_quant_buf_db[idx];
+    q->input_buf     = q->input_buf_db[idx];
+    q->output_buf    = q->output_buf_db[idx];
+    memcpy(q->in_tensors,  q->in_tensors_db[idx],  sizeof(q->in_tensors));
+    memcpy(q->out_tensors, q->out_tensors_db[idx], sizeof(q->out_tensors));
+}
+
+// Execute QNN graph on the CURRENT buffer slot's tensor arrays.
+// For quantized models, Phase 2 already wrote in_quant_buf
 // and Phase 4 will read out_quant_buf directly — no separate quant/dequant pass.
 static Qnn_ErrorHandle_t qnn_execute(struct qnn_state *q)
 {
@@ -1541,10 +1863,12 @@ static void qnn_cleanup(struct qnn_state *q)
     if (q->context) q->qnn.contextFree(q->context, NULL);
     if (q->backend) q->qnn.backendFree(q->backend);
     if (q->sys_ctx) q->sys.systemContextFree(q->sys_ctx);
-    free(q->input_buf);
-    free(q->output_buf);
-    free(q->in_quant_buf);
-    free(q->out_quant_buf);
+    for (int db = 0; db < 2; db++) {
+        free(q->input_buf_db[db]);
+        free(q->output_buf_db[db]);
+        free(q->in_quant_buf_db[db]);
+        free(q->out_quant_buf_db[db]);
+    }
     if (q->htp_lib) dlclose(q->htp_lib);
     if (q->sys_lib) dlclose(q->sys_lib);
     memset(q, 0, sizeof(*q));
@@ -1556,7 +1880,8 @@ static void qnn_cleanup(struct qnn_state *q)
 
 enum anvil_state {
     STATE_NEED_INPUT,
-    STATE_HAVE_INTERP,
+    STATE_HAVE_INTERP,   // interpolated frame ready (or in-flight), output it next
+    STATE_HAVE_CURR,     // interpolated already output, output stored curr next
 };
 
 struct priv {
@@ -1568,6 +1893,9 @@ struct priv {
 
     // Stored interpolated frame (output in HAVE_INTERP state)
     struct mp_image *interp;
+
+    // Stored original curr frame (output in HAVE_CURR state)
+    struct mp_frame stored_curr;
 
     // Prealign workspace (CPU fallback path)
     int alloc_w, alloc_h;
@@ -1590,6 +1918,40 @@ struct priv {
     // QNN state
     struct qnn_state qnn;
     int qnn_checked;
+
+    // ---- Pipeline parallelism (Phase B) ----
+    // HTP async thread: runs QNN inference in background, overlapping with
+    // downstream rendering of the original frame.
+    pthread_t       htp_thread;
+    pthread_mutex_t htp_mutex;
+    pthread_cond_t  htp_ready_cond;   // signaled when HTP result is ready
+    pthread_cond_t  htp_start_cond;   // signaled when new HTP work is submitted
+    int htp_has_work;                 // 1 = HTP thread should run inference
+    int htp_result_ready;             // 1 = HTP finished, result available
+    int htp_ok;                       // result of last inference (1=success)
+    int htp_shutdown;                 // 1 = thread should exit
+    int htp_thread_created;           // 1 = pthread_create succeeded
+
+    // Captured tensor arrays for the HTP thread to use (set at kick time,
+    // before the double-buffer is flipped for the next frame).
+    Qnn_Tensor_t htp_in_tensors[QNN_MAX_TENSORS];
+    Qnn_Tensor_t htp_out_tensors[QNN_MAX_TENSORS];
+
+    // Whether the async HTP path is active for current frame.
+    // When 1, HAVE_INTERP state will call finish_interpolation instead of
+    // just outputting a pre-computed p->interp.
+    int pipeline_active;
+
+    // Data saved by start_interpolation for finish_interpolation:
+    int pending_use_quant_path;       // which warp path was used
+    int pending_buf_idx;              // which QNN double-buffer slot has the data
+    struct mp_image *pending_out;     // pre-allocated output image for Phase 4
+    double pending_pts_prev;          // prev->pts for midpoint PTS
+    double pending_pts_curr;          // curr->pts for midpoint PTS
+    double pending_t_total;           // start time for total timing
+    double pending_t_p1a;             // Phase 1a timing
+    double pending_t_gpu;             // GPU timing
+    double pending_t_copy;            // copy timing
 };
 
 static void free_workspace(struct priv *p)
@@ -1660,6 +2022,238 @@ static double get_time_ms(void)
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+// ====================================================================
+// Section 9a: HTP async thread for pipeline parallelism (Phase B)
+// ====================================================================
+
+static void *htp_thread_fn(void *arg)
+{
+    struct priv *p = (struct priv *)arg;
+    pthread_mutex_lock(&p->htp_mutex);
+    while (!p->htp_shutdown) {
+        // Wait for work
+        while (!p->htp_has_work && !p->htp_shutdown)
+            pthread_cond_wait(&p->htp_start_cond, &p->htp_mutex);
+        if (p->htp_shutdown)
+            break;
+        p->htp_has_work = 0;
+        pthread_mutex_unlock(&p->htp_mutex);
+
+        // Run QNN inference using captured tensor arrays (blocking, ~13ms on HTP).
+        // We use htp_in/out_tensors which were captured at kick time, NOT the
+        // live qnn.in/out_tensors which may have been flipped to the next buffer.
+        Qnn_ErrorHandle_t err = p->qnn.qnn.graphExecute(
+            p->qnn.graph,
+            p->htp_in_tensors, p->qnn.n_in,
+            p->htp_out_tensors, p->qnn.n_out,
+            NULL, NULL);
+
+        pthread_mutex_lock(&p->htp_mutex);
+        p->htp_ok = (err == QNN_SUCCESS) ? 1 : 0;
+        p->htp_result_ready = 1;
+        pthread_cond_signal(&p->htp_ready_cond);
+    }
+    pthread_mutex_unlock(&p->htp_mutex);
+    return NULL;
+}
+
+// Kick HTP inference asynchronously. The current QNN buffer slot must already
+// be filled with input data. Captures the tensor arrays before signaling so
+// the main thread can safely flip the double-buffer for the next frame.
+static void htp_kick_async(struct priv *p)
+{
+    // Capture current tensor arrays before they get flipped
+    memcpy(p->htp_in_tensors,  p->qnn.in_tensors,  sizeof(p->htp_in_tensors));
+    memcpy(p->htp_out_tensors, p->qnn.out_tensors, sizeof(p->htp_out_tensors));
+
+    pthread_mutex_lock(&p->htp_mutex);
+    p->htp_has_work = 1;
+    p->htp_result_ready = 0;
+    pthread_cond_signal(&p->htp_start_cond);
+    pthread_mutex_unlock(&p->htp_mutex);
+}
+
+// Wait for the async HTP inference to complete. Returns the qnn_ok status.
+static int htp_wait(struct priv *p)
+{
+    pthread_mutex_lock(&p->htp_mutex);
+    while (!p->htp_result_ready)
+        pthread_cond_wait(&p->htp_ready_cond, &p->htp_mutex);
+    int ok = p->htp_ok;
+    p->htp_result_ready = 0;
+    pthread_mutex_unlock(&p->htp_mutex);
+    return ok;
+}
+
+// ====================================================================
+// Section 9b: start_interpolation / finish_interpolation (GPU/Q async path)
+// ====================================================================
+
+// Start interpolation: runs P1a + GPU + copy + kicks HTP async.
+// Saves pending data for finish_interpolation. Only for GPU quantized path.
+static void start_interpolation(struct priv *p, struct mp_filter *f,
+                                 struct mp_image *prev, struct mp_image *curr,
+                                 const AVMotionVector *mvs, int n_mvs)
+{
+    int W = curr->w, H = curr->h;
+    double t_phase;
+
+    // ---- Phase 1a: CPU ZOH + downsample -> SSBO mapped memory ----
+    t_phase = get_time_ms();
+    zoh_fill(mvs, n_mvs, p->flow_x, p->flow_y, H, W);
+    int dH, dW;
+    downsample(p->flow_x, p->vk.sm_fx_a_ptr, H, W, PA_DS, &dH, &dW);
+    downsample(p->flow_y, p->vk.sm_fy_a_ptr, H, W, PA_DS, &dH, &dW);
+    int y_stride, uv_stride, u_off, v_off;
+    vk_pack_yuv(p->vk.prev_yuv_ptr,
+                 prev->planes[0], prev->stride[0],
+                 prev->planes[1], prev->stride[1],
+                 prev->planes[2], prev->stride[2],
+                 W, H, &y_stride, &uv_stride, &u_off, &v_off);
+    vk_pack_yuv(p->vk.curr_yuv_ptr,
+                 curr->planes[0], curr->stride[0],
+                 curr->planes[1], curr->stride[1],
+                 curr->planes[2], curr->stride[2],
+                 W, H, &y_stride, &uv_stride, &u_off, &v_off);
+    p->pending_t_p1a = get_time_ms() - t_phase;
+
+    // ---- Phase 1b + Phase 2: GPU dispatches ----
+    float inv_scale = 1.0f / p->qnn.in_scale;
+    int quant_offset = p->qnn.in_offset;
+    t_phase = get_time_ms();
+    vk_dispatch(&p->vk, y_stride, uv_stride, u_off, v_off,
+                 1 /* use_quant */, inv_scale, quant_offset);
+    p->pending_t_gpu = get_time_ms() - t_phase;
+
+    // ---- Copy from SSBO to QNN input buffer (current slot) ----
+    t_phase = get_time_ms();
+    memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, (size_t)W * H * 6);
+    p->pending_t_copy = get_time_ms() - t_phase;
+
+    // ---- Pre-allocate output image ----
+    p->pending_out = mp_image_new_copy(curr);
+    p->pending_pts_prev = prev->pts;
+    p->pending_pts_curr = curr->pts;
+    p->pending_use_quant_path = 1;
+    p->pending_buf_idx = p->qnn.buf_idx;
+
+    // ---- Kick HTP async ----
+    htp_kick_async(p);
+
+    // ---- Flip to the other buffer for the next frame ----
+    qnn_switch_buffer(&p->qnn, 1 - p->qnn.buf_idx);
+
+    p->pipeline_active = 1;
+}
+
+// Finish interpolation: waits for HTP, runs Phase 4, returns completed image.
+// Must be called after start_interpolation when pipeline_active == 1.
+static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f)
+{
+    int W = p->pending_out->w, H = p->pending_out->h;
+    double t_phase;
+
+    // ---- Wait for HTP ----
+    t_phase = get_time_ms();
+    int qnn_ok = htp_wait(p);
+    double t_p3 = get_time_ms() - t_phase;
+
+    if (!qnn_ok)
+        MP_WARN(f, "QNN: graphExecute failed (async), using blend only\n");
+
+    // ---- Phase 4: dequant + residual + clamp + rgb2yuv ----
+    // Use the buffer slot that HTP wrote to (pending_buf_idx)
+    int htp_buf = p->pending_buf_idx;
+
+    t_phase = get_time_ms();
+    struct mp_image *out = p->pending_out;
+    p->pending_out = NULL;
+
+    int gpu_p4 = 0;
+    if (p->vk.ready && p->vk.residual_yuv_pipe && p->pending_use_quant_path) {
+        // ---- GPU Phase 4 path ----
+        gpu_p4 = 1;
+
+        // Upload QNN output to SSBO
+        memcpy(p->vk.qnn_out_ptr, p->qnn.out_quant_buf_db[htp_buf], (size_t)W * H * 3);
+
+        // Zero the YUV output buffers (required for atomicOr)
+        memset(p->vk.y_ptr, 0, p->vk.y_size);
+        memset(p->vk.u_ptr, 0, p->vk.u_size);
+        memset(p->vk.v_ptr, 0, p->vk.v_size);
+
+        // GPU dispatch
+        struct pc_residual_yuv pc = {
+            .W = W, .H = H,
+            .y_stride = W,
+            .uv_stride = W / 2,
+            .in_scale = p->qnn.in_scale,
+            .in_offset = p->qnn.in_offset,
+            .out_scale = p->qnn.out_scale,
+            .out_offset = p->qnn.out_offset,
+            .qnn_ok = qnn_ok,
+        };
+        vk_dispatch_residual_yuv(&p->vk, &pc);
+
+        // Copy from SSBO to output image planes
+        for (int y = 0; y < H; y++)
+            memcpy(out->planes[0] + y * out->stride[0], p->vk.y_ptr + y * W, W);
+        for (int y = 0; y < H / 2; y++) {
+            memcpy(out->planes[1] + y * out->stride[1], p->vk.u_ptr + y * (W / 2), W / 2);
+            memcpy(out->planes[2] + y * out->stride[2], p->vk.v_ptr + y * (W / 2), W / 2);
+        }
+    } else {
+        // ---- CPU Phase 4 fallback (4 threads) ----
+        pthread_t threads[N_THREADS - 1];
+        struct phase4_args args[N_THREADS];
+        int rows_per = (H / N_THREADS) & ~1;
+
+        for (int t = 0; t < N_THREADS; t++) {
+            args[t].y_start = t * rows_per;
+            args[t].y_end = (t == N_THREADS - 1) ? H : (t + 1) * rows_per;
+            args[t].W = W;
+            args[t].H = H;
+            args[t].blend_r = NULL;
+            args[t].blend_g = NULL;
+            args[t].blend_b = NULL;
+            args[t].nhwc_quant = p->qnn.in_quant_buf_db[htp_buf];
+            args[t].in_scale = p->qnn.in_scale;
+            args[t].in_offset = p->qnn.in_offset;
+            args[t].out_quant_buf = p->qnn.out_quant_buf_db[htp_buf];
+            args[t].output_buf = p->qnn.output_buf_db[htp_buf];
+            args[t].out_scale = p->qnn.out_scale;
+            args[t].out_offset = p->qnn.out_offset;
+            args[t].output_quantized = p->qnn.output_is_quantized;
+            args[t].qnn_ok = qnn_ok;
+            args[t].out_Y = out->planes[0]; args[t].out_ys = out->stride[0];
+            args[t].out_U = out->planes[1]; args[t].out_us = out->stride[1];
+            args[t].out_V = out->planes[2]; args[t].out_vs = out->stride[2];
+        }
+
+        for (int t = 0; t < N_THREADS - 1; t++)
+            pthread_create(&threads[t], NULL, phase4_thread_fn, &args[t]);
+        phase4_thread_fn(&args[N_THREADS - 1]);
+        for (int t = 0; t < N_THREADS - 1; t++)
+            pthread_join(threads[t], NULL);
+    }
+
+    out->pts = (p->pending_pts_prev + p->pending_pts_curr) / 2.0;
+    double t_p4 = get_time_ms() - t_phase;
+    double t_all = get_time_ms() - p->pending_t_total;
+
+    if (p->frame_count % 30 == 0)
+        MP_INFO(f, "ANVIL[GPU/Q/async]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
+                t_all, p->pending_t_p1a, p->pending_t_gpu, p->pending_t_copy, t_p3,
+                gpu_p4 ? "(GPU)" : "", t_p4);
+
+    p->pipeline_active = 0;
+    return out;
+}
+
+// ====================================================================
+// Section 9c: Synchronous interpolation pipeline
+// ====================================================================
+
 // Compute prealigned blend + QNN residual -> full interpolated frame.
 // Returns a new mp_image (YUV420P) with PTS set to midpoint.
 //
@@ -1719,47 +2313,60 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
 
         double t_p1a = get_time_ms() - t_phase;
 
+        // Decide if we use the GPU quantized warp path
+        int use_quant_path = p->qnn.ready && p->qnn.input_is_quantized;
+        float inv_scale = use_quant_path ? (1.0f / p->qnn.in_scale) : 0.0f;
+        int quant_offset = use_quant_path ? p->qnn.in_offset : 0;
+
         // ---- Phase 1b + Phase 2: GPU dispatches ----
         t_phase = get_time_ms();
-        vk_dispatch(&p->vk, y_stride, uv_stride, u_off, v_off);
+        vk_dispatch(&p->vk, y_stride, uv_stride, u_off, v_off,
+                     use_quant_path, inv_scale, quant_offset);
         double t_gpu = get_time_ms() - t_phase;
 
-        // ---- Copy NHWC from uncached SSBO to cached buffer, then quantize ----
+        // ---- Copy from SSBO to cached/QNN buffers ----
         t_phase = get_time_ms();
-        size_t nhwc_elems = (size_t)W * H * 6;
-        memcpy(p->nhwc_cached, p->vk.nhwc_ptr, nhwc_elems * sizeof(float));
+        if (use_quant_path) {
+            // GPU already produced uint8 NHWC in nhwc_u8 SSBO — single memcpy
+            memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, (size_t)W * H * 6);
+            // No blend copy needed — Phase 4 derives blend from in_quant_buf
+            blend_r = NULL;
+            blend_g = NULL;
+            blend_b = NULL;
+        } else {
+            // Float path: copy NHWC from uncached SSBO, then quantize/copy for QNN
+            size_t nhwc_elems = (size_t)W * H * 6;
+            memcpy(p->nhwc_cached, p->vk.nhwc_ptr, nhwc_elems * sizeof(float));
 
-        // Write to QNN input buffer (quantize or copy float)
-        if (p->qnn.ready) {
-            if (p->qnn.input_is_quantized) {
-                float inv_s = 1.0f / p->qnn.in_scale;
-                int32_t off = p->qnn.in_offset;
-                const float *src = p->nhwc_cached;
-                uint8_t *dst = p->qnn.in_quant_buf;
-                for (size_t i = 0; i < nhwc_elems; i++) {
-                    float v = roundf(src[i] * inv_s) - (float)off;
-                    int iv = (int)v;
-                    dst[i] = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+            if (p->qnn.ready) {
+                if (p->qnn.input_is_quantized) {
+                    // Should not happen (use_quant_path would be true), but handle anyway
+                    float inv_s = 1.0f / p->qnn.in_scale;
+                    int32_t off = p->qnn.in_offset;
+                    const float *src = p->nhwc_cached;
+                    uint8_t *dst = p->qnn.in_quant_buf;
+                    for (size_t i = 0; i < nhwc_elems; i++) {
+                        float v = roundf(src[i] * inv_s) - (float)off;
+                        int iv = (int)v;
+                        dst[i] = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+                    }
+                } else {
+                    memcpy(p->qnn.input_buf, p->nhwc_cached,
+                           nhwc_elems * sizeof(float));
                 }
-            } else {
-                memcpy(p->qnn.input_buf, p->nhwc_cached,
-                       nhwc_elems * sizeof(float));
             }
+
+            // Copy blend from SSBO to cached for Phase 4
+            size_t px = (size_t)W * H;
+            memcpy(p->blend_rgb[0], p->vk.blend_r_ptr, px * sizeof(float));
+            memcpy(p->blend_rgb[1], p->vk.blend_g_ptr, px * sizeof(float));
+            memcpy(p->blend_rgb[2], p->vk.blend_b_ptr, px * sizeof(float));
+
+            blend_r = p->blend_rgb[0];
+            blend_g = p->blend_rgb[1];
+            blend_b = p->blend_rgb[2];
         }
         double t_copy = get_time_ms() - t_phase;
-
-        // Blend pointers: read from SSBO mapped memory (HOST_COHERENT)
-        // Copy to cached blend_rgb for Phase 4 (uncached reads in inner loop are slow)
-        t_phase = get_time_ms();
-        size_t px = (size_t)W * H;
-        memcpy(p->blend_rgb[0], p->vk.blend_r_ptr, px * sizeof(float));
-        memcpy(p->blend_rgb[1], p->vk.blend_g_ptr, px * sizeof(float));
-        memcpy(p->blend_rgb[2], p->vk.blend_b_ptr, px * sizeof(float));
-        double t_blend_copy = get_time_ms() - t_phase;
-
-        blend_r = p->blend_rgb[0];
-        blend_g = p->blend_rgb[1];
-        blend_b = p->blend_rgb[2];
 
         // ---- Phase 3: HTP inference ----
         t_phase = get_time_ms();
@@ -1775,10 +2382,45 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         }
         double t_p3 = get_time_ms() - t_phase;
 
-        // ---- Phase 4: Fused dequant+residual+clamp+rgb2yuv (4 threads) ----
+        // ---- Phase 4: Fused dequant+residual+clamp+rgb2yuv ----
         t_phase = get_time_ms();
         struct mp_image *out = mp_image_new_copy(curr);
-        {
+        int gpu_p4 = 0;
+
+        if (p->vk.residual_yuv_pipe && use_quant_path) {
+            // ---- GPU Phase 4 path ----
+            gpu_p4 = 1;
+
+            // Upload QNN output to SSBO
+            memcpy(p->vk.qnn_out_ptr, p->qnn.out_quant_buf, (size_t)W * H * 3);
+
+            // Zero the YUV output buffers (required for atomicOr)
+            memset(p->vk.y_ptr, 0, p->vk.y_size);
+            memset(p->vk.u_ptr, 0, p->vk.u_size);
+            memset(p->vk.v_ptr, 0, p->vk.v_size);
+
+            // GPU dispatch
+            struct pc_residual_yuv pc = {
+                .W = W, .H = H,
+                .y_stride = W,
+                .uv_stride = W / 2,
+                .in_scale = p->qnn.in_scale,
+                .in_offset = p->qnn.in_offset,
+                .out_scale = p->qnn.out_scale,
+                .out_offset = p->qnn.out_offset,
+                .qnn_ok = qnn_ok,
+            };
+            vk_dispatch_residual_yuv(&p->vk, &pc);
+
+            // Copy from SSBO to output image planes
+            for (int y = 0; y < H; y++)
+                memcpy(out->planes[0] + y * out->stride[0], p->vk.y_ptr + y * W, W);
+            for (int y = 0; y < H / 2; y++) {
+                memcpy(out->planes[1] + y * out->stride[1], p->vk.u_ptr + y * (W / 2), W / 2);
+                memcpy(out->planes[2] + y * out->stride[2], p->vk.v_ptr + y * (W / 2), W / 2);
+            }
+        } else {
+            // ---- CPU Phase 4 fallback (4 threads) ----
             pthread_t threads[N_THREADS - 1];
             struct phase4_args args[N_THREADS];
             int rows_per = (H / N_THREADS) & ~1;
@@ -1791,6 +2433,9 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
                 args[t].blend_r = blend_r;
                 args[t].blend_g = blend_g;
                 args[t].blend_b = blend_b;
+                args[t].nhwc_quant = use_quant_path ? p->qnn.in_quant_buf : NULL;
+                args[t].in_scale = p->qnn.in_scale;
+                args[t].in_offset = p->qnn.in_offset;
                 args[t].out_quant_buf = p->qnn.out_quant_buf;
                 args[t].output_buf = p->qnn.output_buf;
                 args[t].out_scale = p->qnn.out_scale;
@@ -1814,8 +2459,9 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         double t_all = get_time_ms() - t_total;
 
         if (p->frame_count % 30 == 0)
-            MP_INFO(f, "ANVIL[GPU]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f+%.1f  P3=%.1f  P4=%.1f\n",
-                    t_all, t_p1a, t_gpu, t_copy, t_blend_copy, t_p3, t_p4);
+            MP_INFO(f, "ANVIL[GPU%s]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
+                    use_quant_path ? "/Q" : "", t_all, t_p1a, t_gpu, t_copy, t_p3,
+                    gpu_p4 ? "(GPU)" : "", t_p4);
 
         return out;
 
@@ -1913,6 +2559,9 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
                 args[t].blend_r = blend_r;
                 args[t].blend_g = blend_g;
                 args[t].blend_b = blend_b;
+                args[t].nhwc_quant = NULL;  // CPU path: blend from Phase 2
+                args[t].in_scale = 0;
+                args[t].in_offset = 0;
                 args[t].out_quant_buf = p->qnn.out_quant_buf;
                 args[t].output_buf = p->qnn.output_buf;
                 args[t].out_scale = p->qnn.out_scale;
@@ -1951,25 +2600,48 @@ static void f_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
+    // --- STATE_HAVE_INTERP: output interpolated frame (PTS = midpoint, earlier) ---
     if (p->state == STATE_HAVE_INTERP) {
-        // Output the stored interpolated frame
         if (!mp_pin_in_needs_data(f->ppins[1]))
             return;
 
-        struct mp_image *out = p->interp;
-        p->interp = NULL;
+        struct mp_image *out;
+        if (p->pipeline_active) {
+            out = finish_interpolation(p, f);
+        } else {
+            out = p->interp;
+            p->interp = NULL;
+        }
         mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
+
+        // Now output the stored original curr frame next
+        p->state = STATE_HAVE_CURR;
+        mp_filter_internal_mark_progress(f);
+        return;
+    }
+
+    // --- STATE_HAVE_CURR: output stored original curr frame (PTS = later) ---
+    if (p->state == STATE_HAVE_CURR) {
+        if (!mp_pin_in_needs_data(f->ppins[1]))
+            return;
+
+        mp_pin_in_write(f->ppins[1], p->stored_curr);
+        p->stored_curr = (struct mp_frame){0};
         p->state = STATE_NEED_INPUT;
         return;
     }
 
-    // STATE_NEED_INPUT: read a frame from input
+    // --- STATE_NEED_INPUT: read a frame from input ---
     if (!mp_pin_can_transfer_data(f->ppins[1], f->ppins[0]))
         return;
 
     struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
 
     if (mp_frame_is_signaling(frame)) {
+        if (p->pipeline_active) {
+            struct mp_image *orphan = finish_interpolation(p, f);
+            mp_image_unrefp(&orphan);
+        }
         mp_pin_in_write(f->ppins[1], frame);
         return;
     }
@@ -2003,6 +2675,22 @@ static void f_process(struct mp_filter *f)
         }
     }
 
+    // Start HTP async thread on first frame (after QNN init)
+    if (p->qnn.ready && !p->htp_thread_created) {
+        pthread_mutex_init(&p->htp_mutex, NULL);
+        pthread_cond_init(&p->htp_ready_cond, NULL);
+        pthread_cond_init(&p->htp_start_cond, NULL);
+        p->htp_shutdown = 0;
+        p->htp_has_work = 0;
+        p->htp_result_ready = 0;
+        if (pthread_create(&p->htp_thread, NULL, htp_thread_fn, p) == 0) {
+            p->htp_thread_created = 1;
+            MP_INFO(f, "ANVIL: HTP async thread started (pipeline parallelism)\n");
+        } else {
+            MP_WARN(f, "ANVIL: failed to create HTP thread, using synchronous path\n");
+        }
+    }
+
     // Get MVs from side data
     const AVMotionVector *mvs = NULL;
     int n_mvs = 0;
@@ -2018,8 +2706,8 @@ static void f_process(struct mp_filter *f)
     }
 
     if (p->frame_count % 60 == 1) {
-        MP_INFO(f, "ANVIL: frame %d, %dx%d, %d MVs, qnn=%d\n",
-                p->frame_count, W, H, n_mvs, p->qnn.ready);
+        MP_INFO(f, "ANVIL: frame %d, %dx%d, %d MVs, qnn=%d, async=%d\n",
+                p->frame_count, W, H, n_mvs, p->qnn.ready, p->htp_thread_created);
     }
 
     // First frame (I-frame, no MVs) or no prev: just pass through
@@ -2030,17 +2718,29 @@ static void f_process(struct mp_filter *f)
         return;
     }
 
-    // Compute interpolated frame between prev and curr
-    p->interp = compute_interpolated(p, f, p->prev, mpi, mvs, n_mvs);
+    alloc_workspace(p, W, H);
+
+    // Decide path: async pipeline (GPU/Q + async HTP) or synchronous
+    int use_vk = p->vk.ready && p->vk.W == W && p->vk.H == H;
+    int use_async = use_vk && p->qnn.ready && p->qnn.input_is_quantized
+                    && p->htp_thread_created;
+
+    if (use_async) {
+        p->pending_t_total = get_time_ms();
+        start_interpolation(p, f, p->prev, mpi, mvs, n_mvs);
+    } else {
+        p->interp = compute_interpolated(p, f, p->prev, mpi, mvs, n_mvs);
+    }
 
     // Update prev
     mp_image_unrefp(&p->prev);
     p->prev = mp_image_new_ref(mpi);
 
-    // Output original curr frame first (unmodified)
-    mp_pin_in_write(f->ppins[1], frame);
+    // Store original curr frame for output AFTER interpolated
+    // (Correct PTS order: interp PTS < curr PTS)
+    p->stored_curr = frame;
 
-    // Transition: next call will output interpolated frame
+    // Output interpolated frame first (it has earlier PTS)
     p->state = STATE_HAVE_INTERP;
     mp_filter_internal_mark_progress(f);
 }
@@ -2048,16 +2748,43 @@ static void f_process(struct mp_filter *f)
 static void f_reset(struct mp_filter *f)
 {
     struct priv *p = f->priv;
+    // Drain any in-flight HTP work before resetting
+    if (p->pipeline_active) {
+        struct mp_image *orphan = finish_interpolation(p, f);
+        mp_image_unrefp(&orphan);
+    }
     mp_image_unrefp(&p->prev);
     mp_image_unrefp(&p->interp);
+    mp_image_unrefp(&p->pending_out);
+    mp_frame_unref(&p->stored_curr);
     p->state = STATE_NEED_INPUT;
+    p->pipeline_active = 0;
 }
 
 static void f_destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
+    // Drain any in-flight HTP work
+    if (p->pipeline_active) {
+        struct mp_image *orphan = finish_interpolation(p, f);
+        mp_image_unrefp(&orphan);
+    }
+    // Shut down HTP async thread
+    if (p->htp_thread_created) {
+        pthread_mutex_lock(&p->htp_mutex);
+        p->htp_shutdown = 1;
+        pthread_cond_signal(&p->htp_start_cond);
+        pthread_mutex_unlock(&p->htp_mutex);
+        pthread_join(p->htp_thread, NULL);
+        pthread_mutex_destroy(&p->htp_mutex);
+        pthread_cond_destroy(&p->htp_ready_cond);
+        pthread_cond_destroy(&p->htp_start_cond);
+        p->htp_thread_created = 0;
+    }
     mp_image_unrefp(&p->prev);
     mp_image_unrefp(&p->interp);
+    mp_image_unrefp(&p->pending_out);
+    mp_frame_unref(&p->stored_curr);
     free_workspace(p);
     vk_cleanup(&p->vk);
     qnn_cleanup(&p->qnn);

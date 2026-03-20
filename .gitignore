@@ -12,7 +12,7 @@ local.properties
 *~
 
 # QNN SDK binaries (Qualcomm proprietary, not redistributable)
-# Users must download QAIRT SDK from https://www.qualcomm.com/developer
+# Keep these out of Git; copy them from a local QAIRT install when needed.
 app/src/main/qnnLibs/
 app/src/main/assets/anvil/libQnn*.so
 # Build artifacts

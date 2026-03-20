@@ -1,0 +1,146 @@
+#version 450
+// GPU-side quantized output: upsample flow + warp YUV + BT.709 yuv2rgb + blend
+// + quantize to uint8 NHWC 6ch packed into uint32 buffer.
+//
+// Processes 2 adjacent pixels per invocation (12 bytes = 3 uint32).
+// Eliminates float NHWC and blend buffers entirely.
+//
+// YUV planes are packed contiguously in each frame buffer as bytes:
+//   [Y plane: H*y_stride bytes] [U plane: H/2*uv_stride bytes] [V plane: H/2*uv_stride bytes]
+// Accessed as uint32 (4 bytes per element), byte-level access via shifts.
+
+layout(local_size_x = 8, local_size_y = 16) in;
+
+layout(set=0, binding=0) readonly  buffer FlowX   { float flow_x[]; };
+layout(set=0, binding=1) readonly  buffer FlowY   { float flow_y[]; };
+layout(set=0, binding=2) readonly  buffer Prev    { uint prev_data[]; };
+layout(set=0, binding=3) readonly  buffer Curr    { uint curr_data[]; };
+layout(set=0, binding=4) writeonly buffer NhwcU8  { uint nhwc_u8[]; };
+
+layout(push_constant) uniform Params {
+    int W, H, sW, sH;
+    int y_stride, uv_stride;
+    int u_off, v_off;
+    float inv_scale;
+    int offset;
+};
+
+#define READ_BYTE_PREV(off) float((prev_data[(off)>>2] >> (((off)&3)*8)) & 0xFFu)
+#define READ_BYTE_CURR(off) float((curr_data[(off)>>2] >> (((off)&3)*8)) & 0xFFu)
+
+float bilerp4(float v00, float v10, float v01, float v11, float wx, float wy) {
+    return mix(mix(v00, v10, wx), mix(v01, v11, wx), wy);
+}
+
+// Sample YUV from prev frame, return RGB [0,1]
+vec3 sample_prev(int x, int y, float mvx, float mvy) {
+    float sx = float(x) - mvx * 0.5;
+    float sy = float(y) - mvy * 0.5;
+
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    int x1 = x0+1, y1 = y0+1;
+    float wx = sx-float(x0), wy = sy-float(y0);
+    x0=clamp(x0,0,W-1); x1=clamp(x1,0,W-1);
+    y0=clamp(y0,0,H-1); y1=clamp(y1,0,H-1);
+
+    float yv = bilerp4(READ_BYTE_PREV(y0*y_stride+x0), READ_BYTE_PREV(y0*y_stride+x1),
+                        READ_BYTE_PREV(y1*y_stride+x0), READ_BYTE_PREV(y1*y_stride+x1), wx, wy);
+    int cW=W>>1, cH=H>>1;
+    float csx=sx*0.5, csy=sy*0.5;
+    int cx0=clamp(int(floor(csx)),0,cW-1), cy0=clamp(int(floor(csy)),0,cH-1);
+    int cx1=clamp(cx0+1,0,cW-1), cy1=clamp(cy0+1,0,cH-1);
+    float cwx=csx-float(cx0), cwy=csy-float(cy0);
+
+    float uv = bilerp4(READ_BYTE_PREV(u_off+cy0*uv_stride+cx0), READ_BYTE_PREV(u_off+cy0*uv_stride+cx1),
+                        READ_BYTE_PREV(u_off+cy1*uv_stride+cx0), READ_BYTE_PREV(u_off+cy1*uv_stride+cx1), cwx, cwy);
+    float vv = bilerp4(READ_BYTE_PREV(v_off+cy0*uv_stride+cx0), READ_BYTE_PREV(v_off+cy0*uv_stride+cx1),
+                        READ_BYTE_PREV(v_off+cy1*uv_stride+cx0), READ_BYTE_PREV(v_off+cy1*uv_stride+cx1), cwx, cwy);
+
+    float yf = (yv - 16.0) / 219.0;
+    float uf = (uv - 128.0) / 224.0;
+    float vf = (vv - 128.0) / 224.0;
+    return clamp(vec3(yf + 1.5748*vf, yf - 0.1873*uf - 0.4681*vf, yf + 1.8556*uf), 0.0, 1.0);
+}
+
+// Sample YUV from curr frame, return RGB [0,1]
+vec3 sample_curr(int x, int y, float mvx, float mvy) {
+    float sx = float(x) + mvx * 0.5;
+    float sy = float(y) + mvy * 0.5;
+
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    int x1 = x0+1, y1 = y0+1;
+    float wx = sx-float(x0), wy = sy-float(y0);
+    x0=clamp(x0,0,W-1); x1=clamp(x1,0,W-1);
+    y0=clamp(y0,0,H-1); y1=clamp(y1,0,H-1);
+
+    float yv = bilerp4(READ_BYTE_CURR(y0*y_stride+x0), READ_BYTE_CURR(y0*y_stride+x1),
+                        READ_BYTE_CURR(y1*y_stride+x0), READ_BYTE_CURR(y1*y_stride+x1), wx, wy);
+    int cW=W>>1, cH=H>>1;
+    float csx=sx*0.5, csy=sy*0.5;
+    int cx0=clamp(int(floor(csx)),0,cW-1), cy0=clamp(int(floor(csy)),0,cH-1);
+    int cx1=clamp(cx0+1,0,cW-1), cy1=clamp(cy0+1,0,cH-1);
+    float cwx=csx-float(cx0), cwy=csy-float(cy0);
+
+    float uv = bilerp4(READ_BYTE_CURR(u_off+cy0*uv_stride+cx0), READ_BYTE_CURR(u_off+cy0*uv_stride+cx1),
+                        READ_BYTE_CURR(u_off+cy1*uv_stride+cx0), READ_BYTE_CURR(u_off+cy1*uv_stride+cx1), cwx, cwy);
+    float vv = bilerp4(READ_BYTE_CURR(v_off+cy0*uv_stride+cx0), READ_BYTE_CURR(v_off+cy0*uv_stride+cx1),
+                        READ_BYTE_CURR(v_off+cy1*uv_stride+cx0), READ_BYTE_CURR(v_off+cy1*uv_stride+cx1), cwx, cwy);
+
+    float yf = (yv - 16.0) / 219.0;
+    float uf = (uv - 128.0) / 224.0;
+    float vf = (vv - 128.0) / 224.0;
+    return clamp(vec3(yf + 1.5748*vf, yf - 0.1873*uf - 0.4681*vf, yf + 1.8556*uf), 0.0, 1.0);
+}
+
+// Upsample flow from 1/4 res at pixel (x,y)
+vec2 upsample_flow(int x, int y) {
+    float fsy = float(y)*float(sH)/float(H), fsx = float(x)*float(sW)/float(W);
+    int fx0=clamp(int(floor(fsx)),0,sW-1), fy0=clamp(int(floor(fsy)),0,sH-1);
+    int fx1=clamp(fx0+1,0,sW-1), fy1=clamp(fy0+1,0,sH-1);
+    float fwx=fsx-float(fx0), fwy=fsy-float(fy0);
+    float mvx = bilerp4(flow_x[fy0*sW+fx0],flow_x[fy0*sW+fx1],flow_x[fy1*sW+fx0],flow_x[fy1*sW+fx1],fwx,fwy);
+    float mvy = bilerp4(flow_y[fy0*sW+fx0],flow_y[fy0*sW+fx1],flow_y[fy1*sW+fx0],flow_y[fy1*sW+fx1],fwx,fwy);
+    return vec2(mvx, mvy);
+}
+
+uint quant(float val) {
+    float q = round(val * inv_scale) - float(offset);
+    return uint(clamp(q, 0.0, 255.0));
+}
+
+void main() {
+    int base_x = int(gl_GlobalInvocationID.x) * 2;
+    int y = int(gl_GlobalInvocationID.y);
+    if (base_x >= W || y >= H) return;
+
+    // Pixel A
+    vec2 flow_a = upsample_flow(base_x, y);
+    vec3 rgb0_a = sample_prev(base_x, y, flow_a.x, flow_a.y);
+    vec3 rgb1_a = sample_curr(base_x, y, flow_a.x, flow_a.y);
+    uint qr0a = quant(rgb0_a.r), qg0a = quant(rgb0_a.g), qb0a = quant(rgb0_a.b);
+    uint qr1a = quant(rgb1_a.r), qg1a = quant(rgb1_a.g), qb1a = quant(rgb1_a.b);
+
+    // Pixel B (guard for odd width, though 1080p is always even)
+    uint qr0b = 0u, qg0b = 0u, qb0b = 0u;
+    uint qr1b = 0u, qg1b = 0u, qb1b = 0u;
+    if (base_x + 1 < W) {
+        vec2 flow_b = upsample_flow(base_x + 1, y);
+        vec3 rgb0_b = sample_prev(base_x + 1, y, flow_b.x, flow_b.y);
+        vec3 rgb1_b = sample_curr(base_x + 1, y, flow_b.x, flow_b.y);
+        qr0b = quant(rgb0_b.r); qg0b = quant(rgb0_b.g); qb0b = quant(rgb0_b.b);
+        qr1b = quant(rgb1_b.r); qg1b = quant(rgb1_b.g); qb1b = quant(rgb1_b.b);
+    }
+
+    // Pack 2 pixels (12 bytes) into 3 uint32 (little-endian byte order)
+    // Pixel A: r0a g0a b0a r1a g1a b1a | Pixel B: r0b g0b b0b r1b g1b b1b
+    uint word0 = qr0a | (qg0a << 8u) | (qb0a << 16u) | (qr1a << 24u);
+    uint word1 = qg1a | (qb1a << 8u) | (qr0b << 16u) | (qg0b << 24u);
+    uint word2 = qb0b | (qr1b << 8u) | (qg1b << 16u) | (qb1b << 24u);
+
+    // base_idx is always even, so uint32 offset = base_idx * 3 / 2 = integer
+    int base_idx = y * W + base_x;
+    int wo = base_idx * 3 / 2;
+    nhwc_u8[wo]     = word0;
+    nhwc_u8[wo + 1] = word1;
+    nhwc_u8[wo + 2] = word2;
+}

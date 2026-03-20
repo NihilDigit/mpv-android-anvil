@@ -1,0 +1,99 @@
+#version 450
+// Phase 4 on GPU: dequant blend (6ch input) + dequant residual (3ch output) → YUV420P
+//
+// Each invocation: one 2x2 luma block → 4 Y bytes + 1 U byte + 1 V byte.
+// Y is written via atomicOr (2 bytes per row, packed into uint32).
+// U/V are written one byte each via atomicOr.
+//
+// All atomicOr are safe: each byte position is written by exactly one invocation.
+// The output buffer must be zeroed before dispatch.
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+layout(set=0, binding=0) readonly  buffer NhwcIn { uint nhwc_in[]; };  // 6ch uint8
+layout(set=0, binding=1) readonly  buffer QnnOut { uint qnn_out[]; };  // 3ch uint8
+layout(set=0, binding=2)           buffer YOut   { uint y_out[];   };  // Y plane
+layout(set=0, binding=3)           buffer UOut   { uint u_out[];   };  // U plane
+layout(set=0, binding=4)           buffer VOut   { uint v_out[];   };  // V plane
+
+layout(push_constant) uniform Params {
+    int W, H;
+    int y_stride;       // Y stride in bytes
+    int uv_stride;      // U/V stride in bytes
+    float in_scale;
+    int in_offset;
+    float out_scale;
+    int out_offset;
+    int qnn_ok;         // 1 if QNN succeeded, 0 = blend only
+};
+
+#define READ_BYTE(buf, off) float((buf[(off)>>2] >> (((off)&3)*8)) & 0xFFu)
+
+const float YR = 0.183 * 255.0;
+const float YG = 0.614 * 255.0;
+const float YB = 0.062 * 255.0;
+
+vec3 pixel_rgb(int idx) {
+    // Dequant blend: average of warp0(ch 0-2) and warp1(ch 3-5)
+    int bi = idx * 6;
+    float r0 = READ_BYTE(nhwc_in, bi);
+    float g0 = READ_BYTE(nhwc_in, bi+1);
+    float b0 = READ_BYTE(nhwc_in, bi+2);
+    float r1 = READ_BYTE(nhwc_in, bi+3);
+    float g1 = READ_BYTE(nhwc_in, bi+4);
+    float b1 = READ_BYTE(nhwc_in, bi+5);
+    // in_scale * (val + in_offset) for each, then average
+    float r = in_scale * ((r0 + r1) * 0.5 + float(in_offset));
+    float g = in_scale * ((g0 + g1) * 0.5 + float(in_offset));
+    float b = in_scale * ((b0 + b1) * 0.5 + float(in_offset));
+
+    // Add residual (if QNN succeeded)
+    if (qnn_ok != 0) {
+        int ri = idx * 3;
+        r += out_scale * (READ_BYTE(qnn_out, ri)   + float(out_offset));
+        g += out_scale * (READ_BYTE(qnn_out, ri+1) + float(out_offset));
+        b += out_scale * (READ_BYTE(qnn_out, ri+2) + float(out_offset));
+    }
+
+    return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+uint to_y(vec3 c) {
+    return uint(clamp(YR*c.r + YG*c.g + YB*c.b + 16.5, 0.0, 255.0));
+}
+
+#define WRITE_Y(byte_off, val) atomicOr(y_out[(byte_off)>>2], (val) << ((((byte_off))&3)*8u))
+#define WRITE_U(byte_off, val) atomicOr(u_out[(byte_off)>>2], (val) << ((((byte_off))&3)*8u))
+#define WRITE_V(byte_off, val) atomicOr(v_out[(byte_off)>>2], (val) << ((((byte_off))&3)*8u))
+
+void main() {
+    // Each invocation = one 2x2 chroma block
+    int cx = int(gl_GlobalInvocationID.x);  // chroma column
+    int cy = int(gl_GlobalInvocationID.y);  // chroma row
+    int px = cx * 2;  // luma x
+    int py = cy * 2;  // luma y
+    if (px >= W || py >= H) return;
+
+    bool has_r = (px + 1) < W;
+    bool has_b = (py + 1) < H;
+
+    // Compute 4 pixels
+    vec3 c00 = pixel_rgb(py * W + px);
+    vec3 c10 = has_r ? pixel_rgb(py * W + px + 1) : c00;
+    vec3 c01 = has_b ? pixel_rgb((py+1) * W + px) : c00;
+    vec3 c11 = (has_r && has_b) ? pixel_rgb((py+1) * W + px + 1) : c00;
+
+    // Y: 4 writes (atomicOr safe: each byte written by exactly one invocation)
+    WRITE_Y(py * y_stride + px, to_y(c00));
+    if (has_r) WRITE_Y(py * y_stride + px + 1, to_y(c10));
+    if (has_b) WRITE_Y((py+1) * y_stride + px, to_y(c01));
+    if (has_r && has_b) WRITE_Y((py+1) * y_stride + px + 1, to_y(c11));
+
+    // UV: average 2x2 block
+    vec3 avg = (c00 + c10 + c01 + c11) * (255.0 / 4.0);
+    float uval = -0.101*avg.r - 0.339*avg.g + 0.439*avg.b + 128.0;
+    float vval =  0.439*avg.r - 0.399*avg.g - 0.040*avg.b + 128.0;
+
+    WRITE_U(cy * uv_stride + cx, uint(clamp(uval + 0.5, 0.0, 255.0)));
+    WRITE_V(cy * uv_stride + cx, uint(clamp(vval + 0.5, 0.0, 255.0)));
+}
