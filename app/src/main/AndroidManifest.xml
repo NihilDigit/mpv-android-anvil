@@ -19,6 +19,7 @@
         android:resizeableActivity="true"
         android:requestLegacyExternalStorage="true"
         android:preserveLegacyExternalStorage="true"
+        android:extractNativeLibs="true"
         android:supportsRtl="true"
         android:icon="@mipmap/mpv_launcher_icon"
         android:roundIcon="@mipmap/mpv_launcher_icon"
@@ -26,6 +27,9 @@
         android:label="@string/mpv_activity"
         android:appCategory="video"
         android:localeConfig="@xml/locales_config">
+
+        <!-- ANVIL: vendor DSP RPC library for QNN HTP inference -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false"/>
 
         <!-- Multi-window support on some devices -->
         <meta-data android:name="com.samsung.android.sdk.multiwindow.enable"

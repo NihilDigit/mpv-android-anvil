@@ -33,7 +33,8 @@ dep_unibreak=()
 dep_libass=(freetype2 fontconfig fribidi harfbuzz unibreak)
 dep_lua=()
 dep_libplacebo=()
-dep_mpv=(ffmpeg libass lua libplacebo)
+dep_qairt=()
+dep_mpv=(ffmpeg libass lua libplacebo qairt)
 dep_mpv_android=(mpv)
 
 

@@ -9,7 +9,7 @@ android {
     compileSdk 35
 
     defaultConfig {
-        minSdkVersion 21
+        minSdkVersion 28  // raised for Vulkan + QNN HTP
         targetSdk 35
 
         versionCode 44
@@ -32,6 +32,13 @@ android {
     buildFeatures {
         viewBinding = true
         buildConfig = true
+    }
+
+    sourceSets {
+        main {
+            // Add QNN libs as additional jniLibs source
+            jniLibs.srcDirs += 'src/main/qnnLibs'
+        }
     }
 
     splits {

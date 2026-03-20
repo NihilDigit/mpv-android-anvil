@@ -63,6 +63,31 @@ LOCAL_SRC_FILES := $(PREFIX)/lib/libmpv.so
 LOCAL_EXPORT_C_INCLUDES := $(PREFIX)/include
 include $(PREBUILT_SHARED_LIBRARY)
 
+# ANVIL: QNN HTP libraries (bundled in APK for HTP inference)
+ANVIL_JNILIBS := $(LOCAL_PATH)/../jniLibs/$(TARGET_ARCH_ABI)
+
+ifneq (,$(wildcard $(ANVIL_JNILIBS)/libQnnHtp.so))
+include $(CLEAR_VARS)
+LOCAL_MODULE := libQnnHtp
+LOCAL_SRC_FILES := $(ANVIL_JNILIBS)/libQnnHtp.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libQnnSystem
+LOCAL_SRC_FILES := $(ANVIL_JNILIBS)/libQnnSystem.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libQnnHtpV75Stub
+LOCAL_SRC_FILES := $(ANVIL_JNILIBS)/libQnnHtpV75Stub.so
+include $(PREBUILT_SHARED_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libQnnHtpPrepare
+LOCAL_SRC_FILES := $(ANVIL_JNILIBS)/libQnnHtpPrepare.so
+include $(PREBUILT_SHARED_LIBRARY)
+endif
+
 include $(CLEAR_VARS)
 
 LOCAL_MODULE    := libplayer

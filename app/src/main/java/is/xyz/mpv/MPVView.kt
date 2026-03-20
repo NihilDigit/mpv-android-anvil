@@ -22,17 +22,15 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         // apply phone-optimized defaults
         MPVLib.setOptionString("profile", "fast")
 
-        // vo
-        setVo(if (sharedPreferences.getBoolean("gpu_next", false))
-            "gpu-next"
-        else
-            "gpu")
+        // vo: always use gpu-next (Vulkan) for ANVIL compute shader integration
+        setVo("gpu-next")
 
-        // hwdec
-        val hwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
-            HWDECS
-        else
-            "no"
+        // hwdec: force software decode for MV extraction via export_mvs
+        val hwdec = "no"
+        // Enable MV export from FFmpeg decoder
+        MPVLib.setOptionString("vd-lavc-o", "flags2=+export_mvs")
+        // Enable ANVIL VFI filter
+        MPVLib.setOptionString("vf", "anvil")
 
         // vo: set display fps as reported by android
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {

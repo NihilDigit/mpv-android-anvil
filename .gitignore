@@ -10,3 +10,12 @@ obj
 build/
 local.properties
 *~
+
+# QNN SDK binaries (Qualcomm proprietary, not redistributable)
+# Users must download QAIRT SDK from https://www.qualcomm.com/developer
+app/src/main/qnnLibs/
+app/src/main/assets/anvil/libQnn*.so
+# Build artifacts
+buildscripts/prefix/
+buildscripts/deps/
+buildscripts/sdk/

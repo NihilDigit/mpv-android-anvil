@@ -1,0 +1,3 @@
+    'video/filter/vf_anvil.c',
+    &vf_anvil,
+extern const struct mp_user_filter_entry vf_anvil;
