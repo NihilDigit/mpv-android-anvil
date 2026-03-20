@@ -1,0 +1,5 @@
+=== Power Saver Stress Test ===
+Profile: power_saver (default in new build)
+Start: 2026-03-20 20:07:12
+Baseline capacity: 80%
+Baseline charge: 4372000 µAh
