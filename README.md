@@ -184,7 +184,7 @@ The ANVIL VFI filter (`anvil/filter/vf_anvil.c`, ~2800 lines) implements:
 
 ## Acknowledgments
 
-This demo is built on [mpv-android](https://github.com/mpv-android/mpv-android) (LGPL 2.1+). The ANVIL VFI filter and Vulkan shaders are original work.
+This demo is built on [mpv-android](https://github.com/mpv-android/mpv-android) (MIT, by Ilya Zhuravlev and sfan5), which wraps [mpv](https://mpv.io/) (LGPL 2.1+). The ANVIL VFI filter and Vulkan shaders are original work.
 
 ## License
 
