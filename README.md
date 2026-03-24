@@ -30,7 +30,7 @@ The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion
 | Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy |
 | P3 | HTP V75 (INT8) | 13.5 ms | ANVIL-S inference (async) |
 | P4 | GPU (Adreno 750) | 2.7 ms | Residual + RGB→YUV420 |
-| **Total** | | **25 ms** | < 40 ms budget for 25→50 fps |
+| **Total** | | **27.5 ms** | Median over 30-min stress test (n=1678) |
 
 INT8 quantization loss: **-0.19 dB** (negligible).
 
@@ -148,7 +148,7 @@ QNN: HTP perf profile = power_saver (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
 ANVIL: Vulkan GPU compute ready (1920x1080)
 ANVIL: HTP async thread started (pipeline parallelism)
-ANVIL[GPU/Q/async]: total=25.5ms  P1a=3.3  GPU=2.7  copy=0.9  P3=13.5  P4(GPU)=2.7
+ANVIL[GPU/Q/async]: total=27.5ms  P1a=3.3  GPU=2.7  copy=0.9  P3=13.5  P4(GPU)=2.7
 ```
 
 ### Troubleshooting
