@@ -25,12 +25,12 @@ The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion
 
 | Stage | Hardware | Latency | Description |
 |-------|----------|---------|-------------|
-| P1a | CPU | 3.3 ms | MV densify + downsample + YUV pack |
-| P1b+P2 | GPU (Adreno 750) | 2.7 ms | Prealign v2 + quantized warp |
-| Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy |
-| P3 | HTP V75 (INT8) | 13.5 ms | ANVIL-S inference (async) |
-| P4 | GPU (Adreno 750) | 2.7 ms | Residual + RGB→YUV420 |
-| **Total** | | **27.6 ms** | Median over 30-min stress test (n=1678) |
+| P1a | CPU | 3.3 ms | MV densify + downsample + YUV pack (NEON) |
+| P1b+P2 | GPU (Adreno 750) | 3.3 ms | Prealign v2 + quantized warp |
+| Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy (NEON prefetch) |
+| P3 | HTP V75 (INT8) | 14.9 ms | ANVIL-S inference (pipelined async) |
+| P4 | GPU (Adreno 750) | 3.3 ms | Residual + RGB→YUV420 |
+| **Total** | | **27.1 ms** | Median over 30-min 30fps playback (n=1,579) |
 
 INT8 quantization loss: **-0.19 dB** (negligible).
 
@@ -148,7 +148,7 @@ QNN: HTP perf profile = power_saver (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
 ANVIL: Vulkan GPU compute ready (1920x1080)
 ANVIL: HTP async thread started (pipeline parallelism)
-ANVIL[GPU/Q/async]: total=27.6ms  P1a=3.6  GPU=2.8  copy=1.0  P3=14.5  P4(GPU)=2.7
+ANVIL[GPU/Q/async]: total=27.1ms  P1a=3.3  GPU=3.3  copy=0.9  P3=14.9  P4(GPU)=3.3
 ```
 
 ### Troubleshooting
