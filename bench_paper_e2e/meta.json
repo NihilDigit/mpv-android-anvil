@@ -1,0 +1,17 @@
+{
+  "device": "CPH2691",
+  "soc": "SM8650",
+  "android": "16",
+  "brightness": 2048,
+  "brightness_mode": 0,
+  "duration_min": 30,
+  "sample_interval_s": 10,
+  "start_time": "2026-03-26 22:45:06",
+  "start_battery_level": 74,
+  "start_battery_charge_uah": 4127000,
+  "video": "old_town_cross_30fps.mp4 (1080p H.264 30fps bframes=0 Baseline CRF23)",
+  "end_time": "2026-03-26 23:16:10",
+  "end_battery_level": 62,
+  "end_battery_charge_uah": 3454000,
+  "battery_drop_pct": 12
+}

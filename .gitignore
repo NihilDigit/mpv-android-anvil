@@ -30,6 +30,8 @@ bench_stress/logcat_ps.txt
 *.apk
 *.apk.idsig
 *.jks
-bench_paper_e2e/
-bench_paper_e2e.sh
+bench_paper_e2e/logcat_raw.txt
+bench_paper_e2e/anvil_log.txt
+bench_paper_e2e/anvil_timing.txt
+bench_paper_e2e/anvil_timing.csv
 bench_stress_30fps.sh
