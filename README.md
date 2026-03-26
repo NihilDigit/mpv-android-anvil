@@ -30,7 +30,7 @@ The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion
 | Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy |
 | P3 | HTP V75 (INT8) | 13.5 ms | ANVIL-S inference (async) |
 | P4 | GPU (Adreno 750) | 2.7 ms | Residual + RGB→YUV420 |
-| **Total** | | **27.5 ms** | Median over 30-min stress test (n=1678) |
+| **Total** | | **27.6 ms** | Median over 30-min stress test (n=1678) |
 
 INT8 quantization loss: **-0.19 dB** (negligible).
 
@@ -38,7 +38,7 @@ INT8 quantization loss: **-0.19 dB** (negligible).
 
 | SoC | NPU | 1080p INT8 | Status |
 |-----|-----|:----------:|--------|
-| Snapdragon 8 Gen 3 (SM8650) | HTP V75 | 11.6 ms | Tested |
+| Snapdragon 8 Gen 3 (SM8650) | HTP V75 | 12.8 ms | Tested |
 | Snapdragon 8 Gen 2 (SM8550) | HTP V73 | 15.5 ms | Tested |
 | Snapdragon 7+ Gen 2 (SM7475) | HTP V69 | 720p only | Tested |
 | Dimensity 9300 | APU 790 | 24.4 ms | Tested |
@@ -148,7 +148,7 @@ QNN: HTP perf profile = power_saver (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
 ANVIL: Vulkan GPU compute ready (1920x1080)
 ANVIL: HTP async thread started (pipeline parallelism)
-ANVIL[GPU/Q/async]: total=27.5ms  P1a=3.3  GPU=2.7  copy=0.9  P3=13.5  P4(GPU)=2.7
+ANVIL[GPU/Q/async]: total=27.6ms  P1a=3.6  GPU=2.8  copy=1.0  P3=14.5  P4(GPU)=2.7
 ```
 
 ### Troubleshooting
