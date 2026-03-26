@@ -103,6 +103,15 @@ internal object Utils {
         File("$configDir/subfont.ttf").delete()
 
         writeFontsConf(context, File("$configDir/fonts.conf"))
+
+        // ANVIL: copy QNN context binary + HTP skel to files/anvil/
+        val anvilDir = File(configDir, "anvil")
+        anvilDir.mkdirs()
+        val anvilFiles = arrayOf("anvil/context.serialized.bin", "anvil/libQnnHtpV75Skel.so")
+        for (name in anvilFiles) {
+            val outFile = File("$configDir/$name")
+            copyAssetFile(assetManager, name, outFile)
+        }
     }
 
     fun findRealPath(fd: Int): String? {

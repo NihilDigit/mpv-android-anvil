@@ -1798,9 +1798,9 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
                 {
                     q->power_config_set = 1;
 
-                    // Select power mode from env or default to power_saver
+                    // Select power mode from env or default to performance (max clocks)
                     QnnHtpPerfInfrastructure_PowerMode_t mode =
-                        QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE;
+                        QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
                     const char *perf_env = getenv("ANVIL_HTP_PERF");
                     if (perf_env) {
                         if (strcmp(perf_env, "burst") == 0)
@@ -1824,18 +1824,18 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
                     dcvsConfig.dcvsV3Config.setSleepDisable = 0;
                     dcvsConfig.dcvsV3Config.setBusParams = 1;
                     dcvsConfig.dcvsV3Config.busVoltageCornerMin =
-                        DCVS_VOLTAGE_VCORNER_SVS;
-                    dcvsConfig.dcvsV3Config.busVoltageCornerTarget =
-                        DCVS_VOLTAGE_VCORNER_SVS_PLUS;
-                    dcvsConfig.dcvsV3Config.busVoltageCornerMax =
                         DCVS_VOLTAGE_VCORNER_NOM;
+                    dcvsConfig.dcvsV3Config.busVoltageCornerTarget =
+                        DCVS_VOLTAGE_VCORNER_TURBO;
+                    dcvsConfig.dcvsV3Config.busVoltageCornerMax =
+                        DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
                     dcvsConfig.dcvsV3Config.setCoreParams = 1;
                     dcvsConfig.dcvsV3Config.coreVoltageCornerMin =
-                        DCVS_VOLTAGE_VCORNER_SVS;
-                    dcvsConfig.dcvsV3Config.coreVoltageCornerTarget =
-                        DCVS_VOLTAGE_VCORNER_SVS_PLUS;
-                    dcvsConfig.dcvsV3Config.coreVoltageCornerMax =
                         DCVS_VOLTAGE_VCORNER_NOM;
+                    dcvsConfig.dcvsV3Config.coreVoltageCornerTarget =
+                        DCVS_VOLTAGE_VCORNER_TURBO;
+                    dcvsConfig.dcvsV3Config.coreVoltageCornerMax =
+                        DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
 
                     const QnnHtpPerfInfrastructure_PowerConfig_t *configs[] = {
                         &dcvsConfig, NULL
@@ -2013,21 +2013,24 @@ struct priv {
     Qnn_Tensor_t htp_in_tensors[QNN_MAX_TENSORS];
     Qnn_Tensor_t htp_out_tensors[QNN_MAX_TENSORS];
 
-    // Whether the async HTP path is active for current frame.
-    // When 1, HAVE_INTERP state will call finish_interpolation instead of
-    // just outputting a pre-computed p->interp.
-    int pipeline_active;
+    // Double-buffered pending state for HTP overlap
+    struct {
+        int active;                   // 1 = HTP in flight for this slot
+        int use_quant_path;           // which warp path was used
+        int buf_idx;                  // which QNN double-buffer slot has the data
+        struct mp_image *out;         // pre-allocated output image for Phase 4
+        double pts_prev;              // prev->pts for midpoint PTS
+        double pts_curr;              // curr->pts for midpoint PTS
+        double t_total;               // start time for total timing
+        double t_p1a;                 // Phase 1a timing
+        double t_gpu;                 // GPU timing
+        double t_copy;                // copy timing
+    } pend[2];
+    int pend_cur;                     // slot that start_interpolation writes to (0 or 1)
 
-    // Data saved by start_interpolation for finish_interpolation:
-    int pending_use_quant_path;       // which warp path was used
-    int pending_buf_idx;              // which QNN double-buffer slot has the data
-    struct mp_image *pending_out;     // pre-allocated output image for Phase 4
-    double pending_pts_prev;          // prev->pts for midpoint PTS
-    double pending_pts_curr;          // curr->pts for midpoint PTS
-    double pending_t_total;           // start time for total timing
-    double pending_t_p1a;             // Phase 1a timing
-    double pending_t_gpu;             // GPU timing
-    double pending_t_copy;            // copy timing
+    // For overlap: saved curr frame from previous pair
+    struct mp_frame overlap_curr;
+    int overlap_active;               // 1 = overlap path, output overlap_curr in HAVE_CURR
 };
 
 static void free_workspace(struct priv *p)
@@ -2191,7 +2194,7 @@ static void start_interpolation(struct priv *p, struct mp_filter *f,
                  curr->planes[1], curr->stride[1],
                  curr->planes[2], curr->stride[2],
                  W, H, &y_stride, &uv_stride, &u_off, &v_off);
-    p->pending_t_p1a = get_time_ms() - t_phase;
+    p->pend[p->pend_cur].t_p1a = get_time_ms() - t_phase;
 
     // ---- Phase 1b + Phase 2: GPU dispatches ----
     float inv_scale = 1.0f / p->qnn.in_scale;
@@ -2199,19 +2202,19 @@ static void start_interpolation(struct priv *p, struct mp_filter *f,
     t_phase = get_time_ms();
     vk_dispatch(&p->vk, y_stride, uv_stride, u_off, v_off,
                  1 /* use_quant */, inv_scale, quant_offset);
-    p->pending_t_gpu = get_time_ms() - t_phase;
+    p->pend[p->pend_cur].t_gpu = get_time_ms() - t_phase;
 
     // ---- Copy from SSBO to QNN input buffer (current slot) ----
     t_phase = get_time_ms();
     memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, (size_t)W * H * 6);
-    p->pending_t_copy = get_time_ms() - t_phase;
+    p->pend[p->pend_cur].t_copy = get_time_ms() - t_phase;
 
     // ---- Pre-allocate output image ----
-    p->pending_out = mp_image_new_copy(curr);
-    p->pending_pts_prev = prev->pts;
-    p->pending_pts_curr = curr->pts;
-    p->pending_use_quant_path = 1;
-    p->pending_buf_idx = p->qnn.buf_idx;
+    p->pend[p->pend_cur].out = mp_image_new_copy(curr);
+    p->pend[p->pend_cur].pts_prev = prev->pts;
+    p->pend[p->pend_cur].pts_curr = curr->pts;
+    p->pend[p->pend_cur].use_quant_path = 1;
+    p->pend[p->pend_cur].buf_idx = p->qnn.buf_idx;
 
     // ---- Kick HTP async ----
     htp_kick_async(p);
@@ -2219,14 +2222,16 @@ static void start_interpolation(struct priv *p, struct mp_filter *f,
     // ---- Flip to the other buffer for the next frame ----
     qnn_switch_buffer(&p->qnn, 1 - p->qnn.buf_idx);
 
-    p->pipeline_active = 1;
+    p->pend[p->pend_cur].active = 1;
 }
 
 // Finish interpolation: waits for HTP, runs Phase 4, returns completed image.
-// Must be called after start_interpolation when pipeline_active == 1.
-static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f)
+// Must be called after start_interpolation when pend[slot].active == 1.
+// The slot parameter selects which pending state to drain.
+static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f,
+                                              int slot)
 {
-    int W = p->pending_out->w, H = p->pending_out->h;
+    int W = p->pend[slot].out->w, H = p->pend[slot].out->h;
     double t_phase;
 
     // ---- Wait for HTP ----
@@ -2238,15 +2243,15 @@ static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f
         MP_WARN(f, "QNN: graphExecute failed (async), using blend only\n");
 
     // ---- Phase 4: dequant + residual + clamp + rgb2yuv ----
-    // Use the buffer slot that HTP wrote to (pending_buf_idx)
-    int htp_buf = p->pending_buf_idx;
+    // Use the buffer slot that HTP wrote to (pend[slot].buf_idx)
+    int htp_buf = p->pend[slot].buf_idx;
 
     t_phase = get_time_ms();
-    struct mp_image *out = p->pending_out;
-    p->pending_out = NULL;
+    struct mp_image *out = p->pend[slot].out;
+    p->pend[slot].out = NULL;
 
     int gpu_p4 = 0;
-    if (p->vk.ready && p->vk.residual_yuv_pipe && p->pending_use_quant_path) {
+    if (p->vk.ready && p->vk.residual_yuv_pipe && p->pend[slot].use_quant_path) {
         // ---- GPU Phase 4 path ----
         gpu_p4 = 1;
 
@@ -2313,16 +2318,16 @@ static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f
             pthread_join(threads[t], NULL);
     }
 
-    out->pts = (p->pending_pts_prev + p->pending_pts_curr) / 2.0;
+    out->pts = (p->pend[slot].pts_prev + p->pend[slot].pts_curr) / 2.0;
     double t_p4 = get_time_ms() - t_phase;
-    double t_all = get_time_ms() - p->pending_t_total;
+    double t_all = get_time_ms() - p->pend[slot].t_total;
 
     if (p->frame_count % 30 == 0)
         MP_INFO(f, "ANVIL[GPU/Q/async]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
-                t_all, p->pending_t_p1a, p->pending_t_gpu, p->pending_t_copy, t_p3,
+                t_all, p->pend[slot].t_p1a, p->pend[slot].t_gpu, p->pend[slot].t_copy, t_p3,
                 gpu_p4 ? "(GPU)" : "", t_p4);
 
-    p->pipeline_active = 0;
+    p->pend[slot].active = 0;
     return out;
 }
 
@@ -2676,14 +2681,15 @@ static void f_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
-    // --- STATE_HAVE_INTERP: output interpolated frame (PTS = midpoint, earlier) ---
+    // --- STATE_HAVE_INTERP: output interpolated frame (cold path only, first pair) ---
     if (p->state == STATE_HAVE_INTERP) {
         if (!mp_pin_in_needs_data(f->ppins[1]))
             return;
 
         struct mp_image *out;
-        if (p->pipeline_active) {
-            out = finish_interpolation(p, f);
+        int slot = p->pend_cur;
+        if (p->pend[slot].active) {
+            out = finish_interpolation(p, f, slot);
         } else {
             out = p->interp;
             p->interp = NULL;
@@ -2701,8 +2707,14 @@ static void f_process(struct mp_filter *f)
         if (!mp_pin_in_needs_data(f->ppins[1]))
             return;
 
-        mp_pin_in_write(f->ppins[1], p->stored_curr);
-        p->stored_curr = (struct mp_frame){0};
+        if (p->overlap_active) {
+            mp_pin_in_write(f->ppins[1], p->overlap_curr);
+            p->overlap_curr = (struct mp_frame){0};
+            p->overlap_active = 0;
+        } else {
+            mp_pin_in_write(f->ppins[1], p->stored_curr);
+            p->stored_curr = (struct mp_frame){0};
+        }
         p->state = STATE_NEED_INPUT;
         return;
     }
@@ -2714,9 +2726,12 @@ static void f_process(struct mp_filter *f)
     struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
 
     if (mp_frame_is_signaling(frame)) {
-        if (p->pipeline_active) {
-            struct mp_image *orphan = finish_interpolation(p, f);
-            mp_image_unrefp(&orphan);
+        // Drain any in-flight HTP work
+        for (int s = 0; s < 2; s++) {
+            if (p->pend[s].active) {
+                struct mp_image *orphan = finish_interpolation(p, f, s);
+                mp_image_unrefp(&orphan);
+            }
         }
         mp_pin_in_write(f->ppins[1], frame);
         return;
@@ -2788,6 +2803,13 @@ static void f_process(struct mp_filter *f)
 
     // First frame (I-frame, no MVs) or no prev: just pass through
     if (!p->prev || n_mvs == 0) {
+        // Drain any in-flight HTP work (e.g., scene change after overlap started)
+        for (int s = 0; s < 2; s++) {
+            if (p->pend[s].active) {
+                struct mp_image *orphan = finish_interpolation(p, f, s);
+                mp_image_unrefp(&orphan);
+            }
+        }
         mp_image_unrefp(&p->prev);
         p->prev = mp_image_new_ref(mpi);
         mp_pin_in_write(f->ppins[1], frame);
@@ -2802,48 +2824,93 @@ static void f_process(struct mp_filter *f)
                     && p->htp_thread_created;
 
     if (use_async) {
-        p->pending_t_total = get_time_ms();
-        start_interpolation(p, f, p->prev, mpi, mvs, n_mvs);
+        int prev_slot = p->pend_cur;
+        int has_prev = p->pend[prev_slot].active;  // HTP from previous cycle in flight?
+
+        if (has_prev) {
+            // ===== STEADY STATE: OVERLAP =====
+            // Flip to other pending slot for new work
+            int new_slot = 1 - prev_slot;
+            p->pend_cur = new_slot;
+
+            // Step 1: Start NEW interpolation (CPU/GPU ~10ms + kick HTP)
+            // HTP(prev) is running in parallel during this!
+            p->pend[new_slot].t_total = get_time_ms();
+            start_interpolation(p, f, p->prev, mpi, mvs, n_mvs);
+
+            // Step 2: Finish PREVIOUS interpolation (wait HTP — should be fast due to overlap)
+            struct mp_image *prev_interp = finish_interpolation(p, f, prev_slot);
+
+            // Step 3: Output previous interp frame
+            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, prev_interp));
+
+            // Step 4: Manage curr frames
+            // stored_curr currently holds the PREVIOUS pair's curr frame -> output next in HAVE_CURR
+            p->overlap_curr = p->stored_curr;
+            p->stored_curr = frame;  // save current pair's curr for NEXT cycle
+            p->overlap_active = 1;
+
+            // Update prev
+            mp_image_unrefp(&p->prev);
+            p->prev = mp_image_new_ref(mpi);
+
+            p->state = STATE_HAVE_CURR;
+            mp_filter_internal_mark_progress(f);
+        } else {
+            // ===== COLD START: no overlap =====
+            p->pend[p->pend_cur].t_total = get_time_ms();
+            start_interpolation(p, f, p->prev, mpi, mvs, n_mvs);
+
+            mp_image_unrefp(&p->prev);
+            p->prev = mp_image_new_ref(mpi);
+            p->stored_curr = frame;
+
+            p->state = STATE_HAVE_INTERP;
+            mp_filter_internal_mark_progress(f);
+        }
     } else {
+        // Synchronous path (unchanged)
         p->interp = compute_interpolated(p, f, p->prev, mpi, mvs, n_mvs);
+
+        mp_image_unrefp(&p->prev);
+        p->prev = mp_image_new_ref(mpi);
+        p->stored_curr = frame;
+
+        p->state = STATE_HAVE_INTERP;
+        mp_filter_internal_mark_progress(f);
     }
-
-    // Update prev
-    mp_image_unrefp(&p->prev);
-    p->prev = mp_image_new_ref(mpi);
-
-    // Store original curr frame for output AFTER interpolated
-    // (Correct PTS order: interp PTS < curr PTS)
-    p->stored_curr = frame;
-
-    // Output interpolated frame first (it has earlier PTS)
-    p->state = STATE_HAVE_INTERP;
-    mp_filter_internal_mark_progress(f);
 }
 
 static void f_reset(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     // Drain any in-flight HTP work before resetting
-    if (p->pipeline_active) {
-        struct mp_image *orphan = finish_interpolation(p, f);
-        mp_image_unrefp(&orphan);
+    for (int s = 0; s < 2; s++) {
+        if (p->pend[s].active) {
+            struct mp_image *orphan = finish_interpolation(p, f, s);
+            mp_image_unrefp(&orphan);
+        }
+        mp_image_unrefp(&p->pend[s].out);
     }
     mp_image_unrefp(&p->prev);
     mp_image_unrefp(&p->interp);
-    mp_image_unrefp(&p->pending_out);
     mp_frame_unref(&p->stored_curr);
+    mp_frame_unref(&p->overlap_curr);
+    p->overlap_active = 0;
+    p->pend_cur = 0;
     p->state = STATE_NEED_INPUT;
-    p->pipeline_active = 0;
 }
 
 static void f_destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     // Drain any in-flight HTP work
-    if (p->pipeline_active) {
-        struct mp_image *orphan = finish_interpolation(p, f);
-        mp_image_unrefp(&orphan);
+    for (int s = 0; s < 2; s++) {
+        if (p->pend[s].active) {
+            struct mp_image *orphan = finish_interpolation(p, f, s);
+            mp_image_unrefp(&orphan);
+        }
+        mp_image_unrefp(&p->pend[s].out);
     }
     // Shut down HTP async thread
     if (p->htp_thread_created) {
@@ -2859,8 +2926,8 @@ static void f_destroy(struct mp_filter *f)
     }
     mp_image_unrefp(&p->prev);
     mp_image_unrefp(&p->interp);
-    mp_image_unrefp(&p->pending_out);
     mp_frame_unref(&p->stored_curr);
+    mp_frame_unref(&p->overlap_curr);
     free_workspace(p);
     vk_cleanup(&p->vk);
     qnn_cleanup(&p->qnn);
