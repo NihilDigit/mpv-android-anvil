@@ -989,22 +989,60 @@ static void zoh_fill(const AVMotionVector *mvs, int n_mvs,
         int x0 = bx < 0 ? 0 : bx, y0 = by < 0 ? 0 : by;
         int x1 = bx + m->w > W ? W : bx + m->w;
         int y1 = by + m->h > H ? H : by + m->h;
-        for (int y = y0; y < y1; y++)
-            for (int x = x0; x < x1; x++) {
-                fx[y * W + x] = mx;
-                fy[y * W + x] = my;
+        for (int y = y0; y < y1; y++) {
+            float *fx_row = fx + y * W + x0;
+            float *fy_row = fy + y * W + x0;
+            int w = x1 - x0;
+#ifdef __ARM_NEON
+            float32x4_t vmx = vdupq_n_f32(mx);
+            float32x4_t vmy = vdupq_n_f32(my);
+            int j = 0;
+            for (; j + 4 <= w; j += 4) {
+                vst1q_f32(fx_row + j, vmx);
+                vst1q_f32(fy_row + j, vmy);
             }
+            for (; j < w; j++) {
+                fx_row[j] = mx;
+                fy_row[j] = my;
+            }
+#else
+            for (int j = 0; j < w; j++) {
+                fx_row[j] = mx;
+                fy_row[j] = my;
+            }
+#endif
+        }
     }
 }
 
-// Nearest-neighbor downsample
+// Nearest-neighbor downsample (NEON-optimized for s=4)
 static void downsample(const float *in, float *out, int H, int W, int s,
                        int *oH, int *oW)
 {
     *oH = H / s; *oW = W / s;
-    for (int y = 0; y < *oH; y++)
-        for (int x = 0; x < *oW; x++)
-            out[y * (*oW) + x] = in[y * s * W + x * s];
+#ifdef __ARM_NEON
+    if (s == 4) {
+        // Gather every 4th float: stride=16 bytes between source elements
+        for (int y = 0; y < *oH; y++) {
+            const float *row = in + y * s * W;
+            float *dst = out + y * (*oW);
+            int x = 0;
+            for (; x + 4 <= *oW; x += 4) {
+                // Load 4 source elements spaced 4 apart (indices 0,4,8,12)
+                float32x4_t v = {row[x * 4], row[(x + 1) * 4],
+                                 row[(x + 2) * 4], row[(x + 3) * 4]};
+                vst1q_f32(dst + x, v);
+            }
+            for (; x < *oW; x++)
+                dst[x] = row[x * 4];
+        }
+    } else
+#endif
+    {
+        for (int y = 0; y < *oH; y++)
+            for (int x = 0; x < *oW; x++)
+                out[y * (*oW) + x] = in[y * s * W + x * s];
+    }
 }
 
 // Median filter 2D — uses partial insertion sort (much faster than qsort for k=25)
@@ -1820,8 +1858,9 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
                     dcvsConfig.dcvsV3Config.dcvsEnable = 1;
                     dcvsConfig.dcvsV3Config.powerMode = mode;
                     dcvsConfig.dcvsV3Config.setSleepLatency = 1;
-                    dcvsConfig.dcvsV3Config.sleepLatency = 40;  // µs
-                    dcvsConfig.dcvsV3Config.setSleepDisable = 0;
+                    dcvsConfig.dcvsV3Config.sleepLatency = 10;  // µs (reduced from 40)
+                    dcvsConfig.dcvsV3Config.setSleepDisable = 1;
+                    dcvsConfig.dcvsV3Config.sleepDisable = 1;   // keep DSP awake between inferences
                     dcvsConfig.dcvsV3Config.setBusParams = 1;
                     dcvsConfig.dcvsV3Config.busVoltageCornerMin =
                         DCVS_VOLTAGE_VCORNER_NOM;
@@ -1837,8 +1876,22 @@ static int qnn_init(struct qnn_state *q, struct mp_filter *f, int W, int H)
                     dcvsConfig.dcvsV3Config.coreVoltageCornerMax =
                         DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
 
+                    // RPC control latency: reduce DSP wake latency
+                    QnnHtpPerfInfrastructure_PowerConfig_t rpcLatConfig;
+                    memset(&rpcLatConfig, 0, sizeof(rpcLatConfig));
+                    rpcLatConfig.option =
+                        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
+                    rpcLatConfig.rpcControlLatencyConfig = 100;  // 100µs
+
+                    // RPC polling: keep DSP polling between inferences
+                    QnnHtpPerfInfrastructure_PowerConfig_t rpcPollConfig;
+                    memset(&rpcPollConfig, 0, sizeof(rpcPollConfig));
+                    rpcPollConfig.option =
+                        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
+                    rpcPollConfig.rpcPollingTimeConfig = 9999;  // µs
+
                     const QnnHtpPerfInfrastructure_PowerConfig_t *configs[] = {
-                        &dcvsConfig, NULL
+                        &dcvsConfig, &rpcLatConfig, &rpcPollConfig, NULL
                     };
                     Qnn_ErrorHandle_t perfErr =
                         htpInfra->perfInfra.setPowerConfig(
@@ -2206,7 +2259,28 @@ static void start_interpolation(struct priv *p, struct mp_filter *f,
 
     // ---- Copy from SSBO to QNN input buffer (current slot) ----
     t_phase = get_time_ms();
-    memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, (size_t)W * H * 6);
+    {
+        const size_t n = (size_t)W * H * 6;
+#ifdef __ARM_NEON
+        const uint8_t *src = p->vk.nhwc_u8_ptr;
+        uint8_t *dst = p->qnn.in_quant_buf;
+        size_t i = 0;
+        for (; i + 64 <= n; i += 64) {
+            __builtin_prefetch(src + i + 256, 0, 0);
+            uint8x16_t a = vld1q_u8(src + i);
+            uint8x16_t b = vld1q_u8(src + i + 16);
+            uint8x16_t c = vld1q_u8(src + i + 32);
+            uint8x16_t d = vld1q_u8(src + i + 48);
+            vst1q_u8(dst + i, a);
+            vst1q_u8(dst + i + 16, b);
+            vst1q_u8(dst + i + 32, c);
+            vst1q_u8(dst + i + 48, d);
+        }
+        if (i < n) memcpy(dst + i, src + i, n - i);
+#else
+        memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, n);
+#endif
+    }
     p->pend[p->pend_cur].t_copy = get_time_ms() - t_phase;
 
     // ---- Pre-allocate output image ----
@@ -2408,8 +2482,29 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         // ---- Copy from SSBO to cached/QNN buffers ----
         t_phase = get_time_ms();
         if (use_quant_path) {
-            // GPU already produced uint8 NHWC in nhwc_u8 SSBO — single memcpy
-            memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, (size_t)W * H * 6);
+            // GPU already produced uint8 NHWC in nhwc_u8 SSBO — NEON prefetch copy
+            {
+                const size_t n = (size_t)W * H * 6;
+#ifdef __ARM_NEON
+                const uint8_t *src = p->vk.nhwc_u8_ptr;
+                uint8_t *dst = p->qnn.in_quant_buf;
+                size_t ii = 0;
+                for (; ii + 64 <= n; ii += 64) {
+                    __builtin_prefetch(src + ii + 256, 0, 0);
+                    uint8x16_t a = vld1q_u8(src + ii);
+                    uint8x16_t b = vld1q_u8(src + ii + 16);
+                    uint8x16_t c = vld1q_u8(src + ii + 32);
+                    uint8x16_t d = vld1q_u8(src + ii + 48);
+                    vst1q_u8(dst + ii, a);
+                    vst1q_u8(dst + ii + 16, b);
+                    vst1q_u8(dst + ii + 32, c);
+                    vst1q_u8(dst + ii + 48, d);
+                }
+                if (ii < n) memcpy(dst + ii, src + ii, n - ii);
+#else
+                memcpy(p->qnn.in_quant_buf, p->vk.nhwc_u8_ptr, n);
+#endif
+            }
             // No blend copy needed — Phase 4 derives blend from in_quant_buf
             blend_r = NULL;
             blend_g = NULL;
