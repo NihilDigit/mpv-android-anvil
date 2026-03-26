@@ -25,3 +25,11 @@ demo.mp4
 screen-*.mp4
 docs/demo.mp4
 bench_stress/logcat_ps.txt
+
+# Release artifacts
+*.apk
+*.apk.idsig
+*.jks
+bench_paper_e2e/
+bench_paper_e2e.sh
+bench_stress_30fps.sh
