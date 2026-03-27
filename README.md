@@ -25,10 +25,10 @@ The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion
 
 | Stage | Hardware | Latency | Description |
 |-------|----------|---------|-------------|
-| P1a | CPU | 3.3 ms | MV densify + downsample + YUV pack (NEON) |
-| P1b+P2 | GPU (Adreno 750) | 3.3 ms | Prealign v2 + quantized warp |
+| P1a | CPU | 2.9 ms | MV densify + downsample + YUV pack (NEON) |
+| P1b+P2 | GPU (Adreno 750) | 3.7 ms | Prealign v2 + quantized warp |
 | Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy (NEON prefetch) |
-| P3 | HTP V75 (INT8) | 14.9 ms | ANVIL-S inference (pipelined async) |
+| P3 | HTP V75 (INT8) | 17.0 ms | ANVIL-S inference (pipelined async) |
 | P4 | GPU (Adreno 750) | 3.3 ms | Residual + RGB→YUV420 |
 | **Total** | | **28.4 ms** | Median over 30-min 30fps playback (n=54,623, full-frame logging) |
 
@@ -146,7 +146,7 @@ adb logcat -v brief -s mpv | grep ANVIL
 
 Expected output:
 ```
-ANVIL VFI frame-doubler (25fps -> 50fps, Vulkan GPU + HTP)
+ANVIL VFI frame-doubler (Vulkan GPU + HTP, log_interval=30)
 QNN: graph 'D_unet_v3bs_nomv_1080p', 1 inputs, 1 outputs
 QNN: HTP perf profile = burst (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
@@ -171,7 +171,7 @@ ANVIL[GPU/Q/async]: total=28.4ms  P1a=2.9  GPU=3.7  copy=0.9  P3=17.0  P4(GPU)=3
 - **Demo videos**: Tap any of the 4 scenario cards on the launcher screen
 - **Custom video**: Tap "Load Custom Video" — the app validates H.264 codec and 1080p resolution before playing
 - **A/B comparison**: During playback, tap the screen to show controls, then tap the green **VFI** button to toggle interpolation on/off
-- **Timing data**: Per-frame latency is logged to logcat with tag `mpv` and prefix `ANVIL[GPU/Q/async]`
+- **Timing data**: Latency is logged to logcat every 30th frame (tag `mpv`, prefix `ANVIL[GPU/Q/async]`). Set `log_interval=1` for full-frame logging (see [Reproducing Paper E2E Data](#reproducing-paper-e2e-data))
 
 ### Reproducing Paper E2E Data
 
