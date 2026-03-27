@@ -30,7 +30,7 @@ The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion
 | Copy | CPU | 0.9 ms | 12 MB uint8 NHWC memcpy (NEON prefetch) |
 | P3 | HTP V75 (INT8) | 14.9 ms | ANVIL-S inference (pipelined async) |
 | P4 | GPU (Adreno 750) | 3.3 ms | Residual + RGB→YUV420 |
-| **Total** | | **27.1 ms** | Median over 30-min 30fps playback (n=1,579) |
+| **Total** | | **28.4 ms** | Median over 30-min 30fps playback (n=54,623, full-frame logging) |
 
 INT8 quantization loss: **-0.19 dB** (negligible).
 
@@ -152,7 +152,7 @@ QNN: HTP perf profile = burst (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
 ANVIL: Vulkan GPU compute ready (1920x1080)
 ANVIL: HTP async thread started (pipeline parallelism)
-ANVIL[GPU/Q/async]: total=27.1ms  P1a=3.3  GPU=3.3  copy=0.9  P3=14.9  P4(GPU)=3.3
+ANVIL[GPU/Q/async]: total=28.4ms  P1a=2.9  GPU=3.7  copy=0.9  P3=17.0  P4(GPU)=3.3
 ```
 
 ### Troubleshooting
@@ -172,6 +172,19 @@ ANVIL[GPU/Q/async]: total=27.1ms  P1a=3.3  GPU=3.3  copy=0.9  P3=14.9  P4(GPU)=3
 - **Custom video**: Tap "Load Custom Video" — the app validates H.264 codec and 1080p resolution before playing
 - **A/B comparison**: During playback, tap the screen to show controls, then tap the green **VFI** button to toggle interpolation on/off
 - **Timing data**: Per-frame latency is logged to logcat with tag `mpv` and prefix `ANVIL[GPU/Q/async]`
+
+### Reproducing Paper E2E Data
+
+The paper reports 54,623 full-frame timing samples (Table e2e_latency, Sec. IV-F). The released APK logs every 30th frame to reduce thermal overhead. To reproduce the full-frame dataset:
+
+1. In `anvil/filter/vf_anvil.c`, change `p->log_interval = 30;` to `p->log_interval = 1;` (~line 3059)
+2. Rebuild: `cd buildscripts && bash buildall.sh --arch arm64`
+3. Install and play a 30fps H.264 1080p video for 30 minutes
+4. Collect timing: `bash bench_paper_e2e.sh <device-ip>:5555 30`
+
+**Note:** Full-frame logging adds ~4°C shell temperature compared to sampled logging, which increases DVFS throttling. The paper discloses this overhead and presents the full-frame numbers as a conservative upper bound.
+
+Pre-collected data: `bench_paper_e2e/anvil_timing.csv` (54,623 rows) and `bench_paper_e2e/timing_summary.json`.
 
 ## Architecture
 

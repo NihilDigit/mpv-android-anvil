@@ -3,7 +3,7 @@
 # ANVIL Paper E2E Data Collection — Single 30-minute run
 #
 # Collects ALL e2e data needed for paper Table e2e_latency + Sustained Perf:
-#   1. ANVIL per-frame timing (from logcat, every 30th frame logged)
+#   1. ANVIL per-frame timing (from logcat; set log_interval=1 in vf_anvil.c for full-frame)
 #   2. System telemetry: battery, thermal, CPU/GPU freq (every 10s via dumpsys)
 #   3. Meta: device info, start/end battery, duration
 #

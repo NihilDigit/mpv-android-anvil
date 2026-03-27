@@ -2016,6 +2016,7 @@ enum anvil_state {
 struct priv {
     enum anvil_state state;
     int frame_count;
+    int log_interval;  // 30=default (1/s), change to 1 for full-frame paper bench
 
     // Previous frame for interpolation
     struct mp_image *prev;
@@ -2396,7 +2397,7 @@ static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f
     double t_p4 = get_time_ms() - t_phase;
     double t_all = get_time_ms() - p->pend[slot].t_total;
 
-    if (p->frame_count % 30 == 0)
+    if (p->frame_count % p->log_interval == 0)
         MP_INFO(f, "ANVIL[GPU/Q/async]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
                 t_all, p->pend[slot].t_p1a, p->pend[slot].t_gpu, p->pend[slot].t_copy, t_p3,
                 gpu_p4 ? "(GPU)" : "", t_p4);
@@ -2634,7 +2635,7 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         double t_p4 = get_time_ms() - t_phase;
         double t_all = get_time_ms() - t_total;
 
-        if (p->frame_count % 30 == 0)
+        if (p->frame_count % p->log_interval == 0)
             MP_INFO(f, "ANVIL[GPU%s]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
                     use_quant_path ? "/Q" : "", t_all, t_p1a, t_gpu, t_copy, t_p3,
                     gpu_p4 ? "(GPU)" : "", t_p4);
@@ -2760,7 +2761,7 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         double t_p4 = get_time_ms() - t_phase;
         double t_all = get_time_ms() - t_total;
 
-        if (p->frame_count % 30 == 0)
+        if (p->frame_count % p->log_interval == 0)
             MP_INFO(f, "ANVIL[CPU]: total=%.1fms  P1=%.1f  P2=%.1f  P3=%.1f  P4=%.1f\n",
                     t_all, t_p1, t_p2, t_p3, t_p4);
 
@@ -3053,10 +3054,15 @@ static struct mp_filter *f_create(struct mp_filter *parent, void *options)
 
     p->state = STATE_NEED_INPUT;
 
+    // Timing log interval: 30 = log every 30th frame (~1/s, normal use)
+    // Change to 1 to log every frame for paper-grade e2e statistics.
+    // Full-frame logging adds ~4°C thermal overhead; see paper Sec. IV-F.
+    p->log_interval = 30;
+
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-    MP_INFO(f, "ANVIL VFI frame-doubler (30fps -> 60fps, Vulkan GPU + HTP)\n");
+    MP_INFO(f, "ANVIL VFI frame-doubler (Vulkan GPU + HTP, log_interval=%d)\n", p->log_interval);
     return f;
 }
 
