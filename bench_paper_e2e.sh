@@ -96,7 +96,8 @@ cat > "$OUT_DIR/meta.json" << EOF
     "start_time": "$START_TIME",
     "start_battery_level": $BASELINE_LEVEL,
     "start_battery_charge_uah": $BASELINE_CHARGE,
-    "video": "old_town_cross_30fps.mp4 (1080p H.264 30fps bframes=0 Baseline CRF23)"
+    "video": "old_town_cross_30fps.mp4 (1080p H.264 30fps bframes=0 Baseline CRF23)",
+    "video_note": "HARDCODED — update this field if the test video changes"
 }
 EOF
 

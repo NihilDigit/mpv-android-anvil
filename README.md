@@ -16,10 +16,10 @@ H.264 Software Decode (with MV side-data export)
   → GPU:  Vulkan compute — median + Gauss + warp      (~3 ms)
   → NPU:  QNN HTP INT8 residual network inference    (~13 ms, async)
   → GPU:  Vulkan compute — dequant + residual + YUV   (~3 ms)
-  → Display: 50fps interpolated output
+  → Display: 50fps interpolated output (25→50fps with bundled Xiph clips)
 ```
 
-The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion prior. ANVIL prealigns frames using these MVs, then a tiny pure-Conv residual network (852K params) refines the result. The network uses only NPU-friendly operators (Conv + ReLU), achieving 77% compute-bound ratio on Hexagon HTP — compared to 5% for RIFE.
+The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion prior. ANVIL prealigns frames using these MVs, then a tiny pure-Conv residual network (855K params) refines the result. The network uses only NPU-friendly operators (Conv + ReLU), achieving 77% compute-bound ratio on Hexagon HTP — compared to 5% for RIFE.
 
 ## Performance (SM8650 / Snapdragon 8 Gen 3)
 
@@ -41,8 +41,10 @@ INT8 quantization loss: **-0.19 dB** (negligible).
 | Snapdragon 8 Gen 3 (SM8650) | HTP V75 | 12.8 ms | Tested |
 | Snapdragon 8 Gen 2 (SM8550) | HTP V73 | 15.5 ms | Tested |
 | Snapdragon 7+ Gen 2 (SM7475) | HTP V69 | 720p only | Tested |
-| Dimensity 9300 | APU 790 | 24.4 ms | Tested |
-| Dimensity 9400+ | APU 890 | 25.5 ms | Tested |
+| Dimensity 9300 | APU 790 | 24.4 ms | Paper only* |
+| Dimensity 9400+ | APU 890 | 25.5 ms | Paper only* |
+
+\* MediaTek latency and INT8 quality were validated at the paper level via NeuroPilot Public SDK operator benchmarks and on-device TFLite inference. This demo app requires Qualcomm QNN/HTP and does not run on MediaTek devices.
 
 ## Building from Source
 
@@ -85,7 +87,7 @@ mkdir -p app/src/main/assets/anvil
 cp "$QAIRT_SDK_ROOT/lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so" app/src/main/assets/anvil/
 ```
 
-> **Note:** The V75 Skel/Stub targets Snapdragon 8 Gen 3 (SM8650). For other SoCs, replace with the appropriate version (e.g., `v73` for SD 8 Gen 2, `v69` for SD 7+ Gen 2).
+> **Note:** The V75 Skel/Stub targets Snapdragon 8 Gen 3 (SM8650). For other SoCs, replace with the appropriate version (e.g., `v73` for SD 8 Gen 2, `v69` for SD 7+ Gen 2). Additionally, `libQnnHtpV75Stub.so` and `libQnnHtpV75Skel.so` are hardcoded by name in both `Utils.kt` (asset extraction) and `vf_anvil.c` (dlopen preload list), so switching SoC also requires updating those source references — not just swapping library files.
 
 ### Step 3: Build
 
@@ -112,6 +114,8 @@ adb install -r app/build/outputs/apk/default/debug/app-default-arm64-v8a-debug.a
 ```
 
 On first launch, the app extracts QNN assets (context binary + Skel) from the APK to its private storage. The demo videos are also extracted on first tap.
+
+**Demo videos.** The bundled clips (`old_town_cross`, `crowd_run`, `tractor`, `riverbed`) are Xiph 1080p sequences at 25fps (original 50fps with 50% frame decimation, re-encoded with `bframes=0`). ANVIL doubles them to 50fps. To test with other content, place any H.264 `.mp4` on the device and open it in the app — any frame rate within the latency budget (~33ms per interpolated frame) will work.
 
 **Required device-side config** (`/data/data/com.nihildigit.anvildemo/files/mpv.conf`):
 ```
@@ -142,9 +146,9 @@ adb logcat -v brief -s mpv | grep ANVIL
 
 Expected output:
 ```
-ANVIL VFI frame-doubler (30fps -> 60fps, Vulkan GPU + HTP)
+ANVIL VFI frame-doubler (25fps -> 50fps, Vulkan GPU + HTP)
 QNN: graph 'D_unet_v3bs_nomv_1080p', 1 inputs, 1 outputs
-QNN: HTP perf profile = power_saver (err=0x0)
+QNN: HTP perf profile = burst (err=0x0)
 ANVIL: QNN HTP ready at /data/data/com.nihildigit.anvildemo/files/anvil
 ANVIL: Vulkan GPU compute ready (1920x1080)
 ANVIL: HTP async thread started (pipeline parallelism)
