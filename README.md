@@ -16,7 +16,7 @@ H.264 Software Decode (with MV side-data export)
   → GPU:  Vulkan compute — median + Gauss + warp      (~3 ms)
   → NPU:  QNN HTP INT8 residual network inference    (~13 ms, async)
   → GPU:  Vulkan compute — dequant + residual + YUV   (~3 ms)
-  → Display: 50fps interpolated output (25→50fps with bundled Xiph clips)
+  → Display: 2× frame-doubled output (30→60fps or 25→50fps depending on source)
 ```
 
 The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion prior. ANVIL prealigns frames using these MVs, then a tiny pure-Conv residual network (855K params) refines the result. The network uses only NPU-friendly operators (Conv + ReLU), achieving 77% compute-bound ratio on Hexagon HTP — compared to 5% for RIFE.
@@ -115,7 +115,7 @@ adb install -r app/build/outputs/apk/default/debug/app-default-arm64-v8a-debug.a
 
 On first launch, the app extracts QNN assets (context binary + Skel) from the APK to its private storage. The demo videos are also extracted on first tap.
 
-**Demo videos.** The bundled clips (`old_town_cross`, `crowd_run`, `tractor`, `riverbed`) are Xiph 1080p sequences at 25fps (original 50fps with 50% frame decimation, re-encoded with `bframes=0`). ANVIL doubles them to 50fps. To test with other content, place any H.264 `.mp4` on the device and open it in the app — any frame rate within the latency budget (~33ms per interpolated frame) will work.
+**Demo videos.** The bundled clips are Xiph 1080p sequences re-encoded with `bframes=0`: `old_town_cross` and `crowd_run` at 30fps (60% decimation from 50fps originals, doubled to 60fps), `tractor` and `riverbed` at 25fps (native rate, doubled to 50fps). To test with other content, place any H.264 `.mp4` on the device and open it in the app — any frame rate within the latency budget (~33ms per interpolated frame) will work.
 
 **Required device-side config** (`/data/data/com.nihildigit.anvildemo/files/mpv.conf`):
 ```
