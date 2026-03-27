@@ -1,25 +1,25 @@
 {
-  "n_samples": 1579,
+  "n_samples": 54623,
   "total": {
-    "median": 27.1,
-    "mean": 27.4,
-    "p5": 22.8,
-    "p95": 33.2,
-    "min": 21.9,
-    "max": 57.7
+    "median": 28.4,
+    "mean": 28.1,
+    "p5": 21.9,
+    "p95": 33.4,
+    "min": 20.3,
+    "max": 76.1
   },
   "p1a": {
-    "median": 3.3
+    "median": 2.9
   },
   "gpu": {
-    "median": 3.3
+    "median": 3.7
   },
   "copy": {
     "median": 0.9
   },
   "p3": {
-    "median": 14.9,
-    "p95": 18.3
+    "median": 17.0,
+    "p95": 18.7
   },
   "p4": {
     "median": 3.3

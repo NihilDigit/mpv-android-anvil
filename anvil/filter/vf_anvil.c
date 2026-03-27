@@ -2396,7 +2396,7 @@ static struct mp_image *finish_interpolation(struct priv *p, struct mp_filter *f
     double t_p4 = get_time_ms() - t_phase;
     double t_all = get_time_ms() - p->pend[slot].t_total;
 
-    if (p->frame_count % 30 == 0)
+    if (1)  /* log every frame pair for paper statistics */
         MP_INFO(f, "ANVIL[GPU/Q/async]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
                 t_all, p->pend[slot].t_p1a, p->pend[slot].t_gpu, p->pend[slot].t_copy, t_p3,
                 gpu_p4 ? "(GPU)" : "", t_p4);
@@ -2634,7 +2634,7 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         double t_p4 = get_time_ms() - t_phase;
         double t_all = get_time_ms() - t_total;
 
-        if (p->frame_count % 30 == 0)
+        if (1)  /* log every frame pair for paper statistics */
             MP_INFO(f, "ANVIL[GPU%s]: total=%.1fms  P1a=%.1f  GPU=%.1f  copy=%.1f  P3=%.1f  P4%s=%.1f\n",
                     use_quant_path ? "/Q" : "", t_all, t_p1a, t_gpu, t_copy, t_p3,
                     gpu_p4 ? "(GPU)" : "", t_p4);
@@ -2760,7 +2760,7 @@ static struct mp_image *compute_interpolated(struct priv *p, struct mp_filter *f
         double t_p4 = get_time_ms() - t_phase;
         double t_all = get_time_ms() - t_total;
 
-        if (p->frame_count % 30 == 0)
+        if (1)  /* log every frame pair for paper statistics */
             MP_INFO(f, "ANVIL[CPU]: total=%.1fms  P1=%.1f  P2=%.1f  P3=%.1f  P4=%.1f\n",
                     t_all, t_p1, t_p2, t_p3, t_p4);
 

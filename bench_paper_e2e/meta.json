@@ -6,12 +6,13 @@
   "brightness_mode": 0,
   "duration_min": 30,
   "sample_interval_s": 10,
-  "start_time": "2026-03-26 22:45:06",
-  "start_battery_level": 74,
-  "start_battery_charge_uah": 4127000,
+  "start_time": "2026-03-27 09:34:07",
+  "start_battery_level": 69,
+  "start_battery_charge_uah": 3888000,
   "video": "old_town_cross_30fps.mp4 (1080p H.264 30fps bframes=0 Baseline CRF23)",
-  "end_time": "2026-03-26 23:16:10",
-  "end_battery_level": 62,
-  "end_battery_charge_uah": 3454000,
-  "battery_drop_pct": 12
+  "video_note": "HARDCODED \u2014 update this field if the test video changes",
+  "end_time": "2026-03-27 10:05:07",
+  "end_battery_level": 53,
+  "end_battery_charge_uah": 2981000,
+  "battery_drop_pct": 16
 }
