@@ -35,3 +35,4 @@ bench_paper_e2e/anvil_log.txt
 bench_paper_e2e/anvil_timing.txt
 bench_paper_e2e/anvil_timing.csv
 bench_stress_30fps.sh
+*.keystore

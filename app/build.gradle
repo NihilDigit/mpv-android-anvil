@@ -8,6 +8,15 @@ android {
     namespace 'is.xyz.mpv'
     compileSdk 35
 
+    signingConfigs {
+        release {
+            storeFile file(System.getenv("ANVIL_KEYSTORE") ?: "${System.getProperty('user.home')}/anvil-release.keystore")
+            storePassword System.getenv("ANVIL_KEYSTORE_PASS") ?: ""
+            keyAlias "anvil"
+            keyPassword System.getenv("ANVIL_KEYSTORE_PASS") ?: ""
+        }
+    }
+
     defaultConfig {
         applicationId "com.nihildigit.anvildemo"
         minSdkVersion 28  // raised for Vulkan + QNN HTP
@@ -39,6 +48,12 @@ android {
         main {
             // Add QNN libs as additional jniLibs source
             jniLibs.srcDirs += 'src/main/qnnLibs'
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
         }
     }
 
