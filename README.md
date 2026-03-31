@@ -2,7 +2,7 @@
 
 Demo application for **ANVIL** (Accelerator-Native Video InterpoLation), a video frame interpolation system designed for mobile NPU deployment. This app performs real-time 30→60fps frame doubling on 1080p H.264 video using a three-accelerator pipeline (CPU + GPU + NPU) on Qualcomm Snapdragon SoCs.
 
-> **Paper**: *ANVIL: Accelerator-Native Video InterpoLation for Mobile NPU Deployment* (under review)
+> **Paper**: [ANVIL: Accelerator-Native Video Interpolation via Codec Motion Vector Priors](https://arxiv.org/abs/2603.26835)
 
 https://github.com/user-attachments/assets/01a61b64-5a0a-4553-9d10-66b896afaf7a
 
