@@ -12,11 +12,11 @@ The demo includes 4 embedded Xiph test sequences representing different VFI scen
 
 ```
 H.264 Software Decode (with MV side-data export)
-  → CPU:  ZOH densify + 4× downsample               (~3 ms)
-  → GPU:  Vulkan compute — median + Gauss + warp      (~3 ms)
-  → NPU:  QNN HTP INT8 residual network inference    (~13 ms, async)
-  → GPU:  Vulkan compute — dequant + residual + YUV   (~3 ms)
-  → Display: 2× frame-doubled output (30→60fps or 25→50fps depending on source)
+  → CPU:  ZOH densify + 4× downsample               (~2.9 ms)
+  → GPU:  Vulkan compute — median + Gauss + warp      (~3.7 ms)
+  → NPU:  QNN HTP INT8 residual network inference    (~17 ms, async pipelined)
+  → GPU:  Vulkan compute — dequant + residual + YUV   (~3.3 ms)
+  → Display: 2× frame-doubled output (30→60fps)
 ```
 
 The key insight: H.264 encoder motion vectors (MVs) provide a free coarse motion prior. ANVIL prealigns frames using these MVs, then a tiny pure-Conv residual network (855K params) refines the result. The network uses only NPU-friendly operators (Conv + ReLU), achieving 77% compute-bound ratio on Hexagon HTP — compared to 5% for RIFE.
